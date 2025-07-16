@@ -42,9 +42,11 @@ template<int axis, bool assume_aligned,
          int N_THREADS = WARP_THREADS>
 __device__ inline void load_global_to_registers(
     float4* reg_buffer, int buffer_size,
-    const GL& src, const COORD& idx, const ST& dst_template, int offset, int split)
+    const GL& src, const COORD& idx, const ST& dst_template)
 {
     using T = typename ST::dtype;
+    int offset = 0;
+    int split = 1;
     constexpr int elem_per_memcpy = sizeof(float4)/sizeof(T);
     constexpr int memcpy_per_row = ST::cols / elem_per_memcpy;
     constexpr int total_chunks = (ST::rows * ST::cols) / elem_per_memcpy;
@@ -55,14 +57,13 @@ __device__ inline void load_global_to_registers(
     const int big_calls_end = big_calls_start + (big_calls / split);
 
     const int row_stride = src.template stride<axis>();
-    const int row_stride_bytes = row_stride * sizeof(T);
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
     T* base_ptr = (T*)&src[unit_coord];  // global memory pointer
     const int laneid = threadIdx.x % N_THREADS;
 
     // buffer resource
     const int total_bytes = row_stride * ST::rows * sizeof(T);
-    i32x4 srsrc = make_srsrc(base_ptr, total_bytes, row_stride_bytes);
+    i32x4 srsrc = make_srsrc(base_ptr, total_bytes);
 
     int buf_idx = 0;
     for (int i = 0; i < big_calls && buf_idx < buffer_size; ++i) {
