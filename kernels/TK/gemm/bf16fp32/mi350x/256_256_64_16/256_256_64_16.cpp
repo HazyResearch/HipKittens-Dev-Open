@@ -118,6 +118,7 @@ void micro_tk(const micro_globals g) {
         __builtin_amdgcn_s_setprio(1);
         mma_ABt(C_accum[0], tiles[1], tiles[0], C_accum[0]);
         mma_ABt(C_accum[1], tiles[2], tiles[0], C_accum[1]);
+        __builtin_amdgcn_s_setprio(0);
        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -132,6 +133,7 @@ void micro_tk(const micro_globals g) {
         __builtin_amdgcn_s_setprio(1);
         mma_ABt(C_accum[0], tiles[1], tiles[0], C_accum[0]);
         mma_ABt(C_accum[1], tiles[2], tiles[0], C_accum[1]);
+        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
@@ -148,6 +150,7 @@ void micro_tk(const micro_globals g) {
         __builtin_amdgcn_s_setprio(1);
         mma_ABt(C_accum[0], tiles[1], tiles[0], C_accum[0]);
         mma_ABt(C_accum[1], tiles[2], tiles[0], C_accum[1]);
+        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
