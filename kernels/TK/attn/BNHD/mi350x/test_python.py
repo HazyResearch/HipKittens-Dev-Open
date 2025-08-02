@@ -4,7 +4,7 @@ import random
 import time
 import math
 from torch.nn.functional import scaled_dot_product_attention
-from aiter.ops.triton.mha import flash_attn_func
+import aiter
 
 profiling = True
 using_aiter = True
@@ -125,12 +125,12 @@ if profiling:
     # Reference matmul using AITER
     if using_aiter:
         for _ in range(num_warmup):
-            out_ref = flash_attn_func(q, k, v, causal=causal, return_lse=True, deterministic=True)
+            out_ref = aiter.flash_attn_func(q, k, v, causal=causal, return_lse=True, deterministic=True)
         timings_ref = []
         for _ in range(num_iters):
             torch.cuda.synchronize()
             start_event.record()
-            out_ref = flash_attn_func(q, k, v, causal=causal, return_lse=True, deterministic=True)
+            out_ref = aiter.flash_attn_func(q, k, v, causal=causal, return_lse=True, deterministic=True)
             end_event.record()
             torch.cuda.synchronize()
             elapsed_time = start_event.elapsed_time(end_event)
