@@ -94,6 +94,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
         g.Vg, {batch_idx, 0, head_idx_kv, 0}, v_smem[0], swizzled_offsets_V);
     load_lds_reg_row(k_reg, k_smem[0]);
+    swap_layout_and_transpose(k_reg_transposed, k_reg);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -101,7 +102,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
     // Each warp performs QK0
     asm volatile("s_waitcnt lgkmcnt(0)");
     zero(att_block[0]);
-    swap_layout_and_transpose(k_reg_transposed, k_reg);
     mma_AtB(att_block[0], k_reg_transposed, q_reg_transposed, att_block[0]);
 
     // Each warp performs a partial softmax of QK0 (i.e. some of the online softmax up until but not including the second exponential scaling of the attention block likely)
@@ -109,31 +109,31 @@ __global__ void attend_ker(const attn_globals<D> g) {
     sub_col(att_block[0], att_block[0], max_vec);
     exp2(att_block[0], att_block[0]);
 
-    // All warps then collaboratively load in the third slice of K (K2) into shared memory
-    load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
-        g.Kg, {batch_idx, 2, head_idx_kv, 0}, k_smem[0], swizzled_offsets_K);
-
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
     }
 
+    // All warps then load in the second slice of K (K1)
+    load_lds_reg_row(k_reg, k_smem[1]);
+    // All warps then collaboratively load in the third slice of K (K2) into shared memory
+    load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
+        g.Kg, {batch_idx, 2, head_idx_kv, 0}, k_smem[0], swizzled_offsets_K);
+    swap_layout_and_transpose(k_reg_transposed, k_reg);
     // All warps then collaboratively load in the second slice of V (V1) into shared memory 
     load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
         g.Vg, {batch_idx, 1, head_idx_kv, 0}, v_smem[1], swizzled_offsets_V);
-    // All warps then load in the second slice of K (K1)
-    load_lds_reg_row(k_reg, k_smem[1]);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     // hot loop
+    #pragma unroll (1)
     for (int j = 3; j < num_tiles - 1; j += 2) {
 
         // Cluster 0:
         //      QK1
         asm volatile("s_waitcnt lgkmcnt(0)");
         zero(att_block[1]);
-        swap_layout_and_transpose(k_reg_transposed, k_reg);
         mma_AtB(att_block[1], k_reg_transposed, q_reg_transposed, att_block[1]);
         //      Finish softmax for QK0
         sub(max_vec_prev, max_vec_prev, max_vec); 
@@ -173,11 +173,12 @@ __global__ void attend_ker(const attn_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 3:
+        //      Load K2 into registers
+        load_lds_reg_row(k_reg, k_smem[0]);
         //      Load V2 into shared
         load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
             g.Vg, {batch_idx, j - 1, head_idx_kv, 0}, v_smem[0], swizzled_offsets_V);
-        //      Load K2 into registers
-        load_lds_reg_row(k_reg, k_smem[0]);
+        swap_layout_and_transpose(k_reg_transposed, k_reg);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -186,7 +187,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         //      QK2
         // asm volatile("s_waitcnt lgkmcnt(0)");
         zero(att_block[0]);
-        swap_layout_and_transpose(k_reg_transposed, k_reg);
         mma_AtB(att_block[0], k_reg_transposed, q_reg_transposed, att_block[0]);
         //      Finish softmax for QK1
         sub(max_vec_prev, max_vec_prev, max_vec); 
@@ -226,11 +226,12 @@ __global__ void attend_ker(const attn_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 7:
+        //      Load K3 into registers
+        load_lds_reg_row(k_reg, k_smem[1]);
         //      Load V3 into shared
         load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
             g.Vg, {batch_idx, j, head_idx_kv, 0}, v_smem[1], swizzled_offsets_V);
-        //      Load K3 into registers
-        load_lds_reg_row(k_reg, k_smem[1]);
+        swap_layout_and_transpose(k_reg_transposed, k_reg);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -247,6 +248,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     col_sum(norm_vec, att_block[0], norm_vec);
     copy(att_block_bf16, att_block[0]);
     att_block_col_bf16 = *(attn_tile<D, bf16, col_l>*)(&att_block_bf16);
+    sub(max_vec_prev, max_vec_prev, max_vec); 
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -265,9 +267,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
     //      A2V2
     asm volatile("s_waitcnt lgkmcnt(0)");
     __builtin_amdgcn_s_setprio(1);
-    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
-    sub(max_vec_prev, max_vec_prev, max_vec); 
     exp2(max_vec_prev, max_vec_prev);  
+    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
     mul(norm_vec, norm_vec, max_vec_prev);
     mul_col(o_reg, o_reg, max_vec_prev);
     //      Partial softmax for QK3
@@ -280,11 +281,12 @@ __global__ void attend_ker(const attn_globals<D> g) {
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 3:
+    //      Load K4 into registers
+    load_lds_reg_row(k_reg, k_smem[0]);
     //      Load V4 into shared
     load_global_to_shared_direct_with_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D>>, NUM_THREADS>(
         g.Vg, {batch_idx, num_tiles - 2, head_idx_kv, 0}, v_smem[0], swizzled_offsets_V);
-    //      Load K4 into registers
-    load_lds_reg_row(k_reg, k_smem[0]);
+    swap_layout_and_transpose(k_reg_transposed, k_reg);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -293,13 +295,13 @@ __global__ void attend_ker(const attn_globals<D> g) {
     //      QK4
     asm volatile("s_waitcnt lgkmcnt(0)");
     zero(att_block[0]);
-    swap_layout_and_transpose(k_reg_transposed, k_reg);
+    exp2(att_block[1], att_block[1]);
     mma_AtB(att_block[0], k_reg_transposed, q_reg_transposed, att_block[0]);
     //      Finish softmax for QK3
-    exp2(att_block[1], att_block[1]);
     col_sum(norm_vec, att_block[1], norm_vec);
     copy(att_block_bf16, att_block[1]);
     att_block_col_bf16 = *(attn_tile<D, bf16, col_l>*)(&att_block_bf16);
+    sub(max_vec_prev, max_vec_prev, max_vec); 
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -314,17 +316,14 @@ __global__ void attend_ker(const attn_globals<D> g) {
     // Cluster 6:
     //      A3V3
     asm volatile("s_waitcnt lgkmcnt(0)");
-    __builtin_amdgcn_s_setprio(1);
-    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
-    sub(max_vec_prev, max_vec_prev, max_vec); 
     exp2(max_vec_prev, max_vec_prev);  
+    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
     mul(norm_vec, norm_vec, max_vec_prev);
     mul_col(o_reg, o_reg, max_vec_prev);
     //      Partial softmax for QK4
     copy(max_vec_prev, max_vec);
     col_max(max_vec, att_block[0], max_vec);
     sub_col(att_block[0], att_block[0], max_vec);
-    __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -364,9 +363,9 @@ __global__ void attend_ker(const attn_globals<D> g) {
     // Cluster 10:
     //      A4V4
     asm volatile("s_waitcnt lgkmcnt(0)");
-    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
     sub(max_vec_prev, max_vec_prev, max_vec); 
     exp2(max_vec_prev, max_vec_prev);  
+    mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
     mul(norm_vec, norm_vec, max_vec_prev);
     mul_col(o_reg, o_reg, max_vec_prev);
     //      Full softmax for QK5
@@ -375,11 +374,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
     sub_col(att_block[1], att_block[1], max_vec);
     exp2(att_block[1], att_block[1]);
     sub(max_vec_prev, max_vec_prev, max_vec); 
-    exp2(max_vec_prev, max_vec_prev);  
-    mul(norm_vec, norm_vec, max_vec_prev);
-    col_sum(norm_vec, att_block[1], norm_vec);
-    copy(att_block_bf16, att_block[1]);
-    att_block_col_bf16 = *(attn_tile<D, bf16, col_l>*)(&att_block_bf16);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -394,6 +388,11 @@ __global__ void attend_ker(const attn_globals<D> g) {
     // Cluster 12:
     //      A5V5
     asm volatile("s_waitcnt lgkmcnt(0)");
+    exp2(max_vec_prev, max_vec_prev);  
+    mul(norm_vec, norm_vec, max_vec_prev);
+    col_sum(norm_vec, att_block[1], norm_vec);
+    copy(att_block_bf16, att_block[1]);
+    att_block_col_bf16 = *(attn_tile<D, bf16, col_l>*)(&att_block_bf16);
     mma_AtB(o_reg, v_reg, att_block_col_bf16, o_reg);
     mul_col(o_reg, o_reg, max_vec_prev);
     __builtin_amdgcn_sched_barrier(0);
