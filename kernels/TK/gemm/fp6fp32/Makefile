@@ -2,7 +2,7 @@
 GPU_TARGET=CDNA4
 
 TARGET=tk_kernel
-SRC=kernel.cpp
+SRC=matmul_kernel.cpp
 
 # HIP variables
 ROCM_INSTALL_DIR := $(ROCM_PATH)
@@ -34,9 +34,10 @@ ICPPFLAGS += $(CPPFLAGS)
 ILDFLAGS  += $(LDFLAGS)
 ILDLIBS   += $(LDLIBS)
 
-PY_LDFLAGS := $(shell python3-config --ldflags | sed 's/-lcrypt//g')
-ICXXFLAGS += $(PY_LDFLAGS)
-ICXXFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype $(shell python3 -m pybind11 --includes) -shared -fPIC -Rpass-analysis=kernel-resource-usage
+# PY_LDFLAGS := $(shell python3-config --ldflags | sed 's/-lcrypt//g')
+# ICXXFLAGS += $(PY_LDFLAGS)
+# ICXXFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype $(shell python3 -m pybind11 --includes) -shared -fPIC -Rpass-analysis=kernel-resource-usage
+ICXXFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype -Rpass-analysis=kernel-resource-usage
 
 
 # Default target
@@ -45,9 +46,14 @@ all: $(TARGET)
 # LOGDIR := data_logs/$(shell date +%m%d_%H%M%S)_outputs
 # LOGFILE := $(LOGDIR)/make_build.log
 # 
+# $(TARGET): $(SRC)
+# 	$(HIPCXX) $(SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) \
+# 	    -o $(TARGET)$(shell python3-config --extension-suffix) 
+
 $(TARGET): $(SRC)
 	$(HIPCXX) $(SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) \
-	    -o $(TARGET)$(shell python3-config --extension-suffix) 
+	    -o $(TARGET)
+
 
 # Clean target
 clean:
