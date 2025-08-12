@@ -18,7 +18,7 @@ using dout = float;
 
 
 constexpr int BLOCK_SIZE       = 256;  
-constexpr int K_STEP           = 128;
+constexpr int K_STEP           = 64;
 constexpr int REG_BLOCK_M      = BLOCK_SIZE / 2;
 constexpr int REG_BLOCK_N      = BLOCK_SIZE / 4;
 constexpr int DOT_SLICE        = 64;
@@ -91,22 +91,20 @@ void micro_tk(const micro_globals g) {
 
     int tic = 0;
     int toc = 1;
-    using T = typename st_f6<BLOCK_SIZE, K_STEP>::dtype;
-    constexpr int bytes_per_thread = 16;
-    constexpr int bytes_per_memcpy = bytes_per_thread * NUM_THREADS;
-    constexpr int memcpy_per_tile = BLOCK_SIZE * K_STEP * sizeof(T) / bytes_per_memcpy;
+    constexpr int bytes_per_thread = 12;
+    constexpr int memcpy_per_tile = (BLOCK_SIZE * K_STEP * 6 / 8) / (bytes_per_thread * NUM_THREADS);
 
 
     // Register array to store swizzled global addresses for each thread.
     uint32_t swizzled_offsets_B[memcpy_per_tile];
     uint32_t swizzled_offsets_A[memcpy_per_tile];
-    // prefill_swizzled_offsets_fp6<2, false, rt_f6<REG_BLOCK_M, DOT_SLICE>, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, 0}, As[tic], swizzled_offsets_A);
-    // prefill_swizzled_offsets_fp6<2, false, rt_f6<REG_BLOCK_M, DOT_SLICE>, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, 0}, Bs[tic], swizzled_offsets_B);
+    prefill_swizzled_offsets_fp6<2, false, rt_f6<REG_BLOCK_M, DOT_SLICE>, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, 0}, As[tic], swizzled_offsets_A);
+    prefill_swizzled_offsets_fp6<2, false, rt_f6<REG_BLOCK_M, DOT_SLICE>, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, 0}, Bs[tic], swizzled_offsets_B);
     __builtin_amdgcn_s_barrier();
 
     // // Load first tile into shared memory
-    // load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, 0}, As[tic], swizzled_offsets_A);
-    // load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, 0}, Bs[tic], swizzled_offsets_B);
+    load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, 0}, As[tic], swizzled_offsets_A);
+    load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, 0}, Bs[tic], swizzled_offsets_B);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
 
@@ -118,26 +116,13 @@ void micro_tk(const micro_globals g) {
     for (int tile = 0; tile < num_tiles - 1; ++tile, tic^=1, toc^=1) {
 
         // Cluster 0
-        // load_lds_reg_row_fp6(B_tile, subtile_inplace<REG_BLOCK_N, DOT_SLICE>(Bs[tic], {warp_col, 0}));
-        // load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, tile+1}, As[toc], swizzled_offsets_A);
-        // load_lds_reg_row_fp6(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[tic], {warp_row, 0}));
-        // load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, tile+1}, Bs[toc], swizzled_offsets_B);
+        load_lds_reg_row_fp6(B_tile, subtile_inplace<REG_BLOCK_N, DOT_SLICE>(Bs[tic], {warp_col, 0}));
+        load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_A, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.a, {0, 0, row, tile+1}, As[toc], swizzled_offsets_A);
+        load_lds_reg_row_fp6(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[tic], {warp_row, 0}));
+        load_global_to_shared_direct_with_swizzled_offsets_fp6<2, false, st_f6<BLOCK_SIZE, K_STEP>, _gl_B, coord<st_f6<BLOCK_SIZE, K_STEP>>, NUM_THREADS>(g.b, {0, 0, col, tile+1}, Bs[toc], swizzled_offsets_B);
         __builtin_amdgcn_s_barrier();
 
         // Cluster 1
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        __builtin_amdgcn_s_setprio(1);
-        mma_ABt(C_accum, A_tile, B_tile, C_accum);
-        __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
-        
-        // Cluster 2
-        load_lds_reg_row_fp6(B_tile, subtile_inplace<REG_BLOCK_N, DOT_SLICE>(Bs[tic], {warp_col, 1}));
-        load_lds_reg_row_fp6(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[tic], {warp_row, 1}));
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_s_barrier();
-
-        // Cluster 3 (compute)
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_setprio(1);
         mma_ABt(C_accum, A_tile, B_tile, C_accum);
@@ -160,19 +145,6 @@ void micro_tk(const micro_globals g) {
     __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_s_barrier();
 
-    // Cluster 2 (load)
-    __builtin_amdgcn_s_barrier();
-    load_lds_reg_row_fp6(B_tile, subtile_inplace<REG_BLOCK_N, DOT_SLICE>(Bs[tic], {warp_col, 1}));
-    load_lds_reg_row_fp6(A_tile, subtile_inplace<REG_BLOCK_M, DOT_SLICE>(As[tic], {warp_row, 1}));
-    __builtin_amdgcn_s_barrier();
-
-    // Cluster 3 (compute)
-    asm volatile("s_waitcnt lgkmcnt(0)");
-    __builtin_amdgcn_s_setprio(1);
-    mma_ABt(C_accum, A_tile, B_tile, C_accum);
-    __builtin_amdgcn_s_setprio(0);
-    __builtin_amdgcn_s_barrier();
-
     if (warp_row == 0) {
         __builtin_amdgcn_s_barrier();
     }
@@ -183,18 +155,18 @@ void micro_tk(const micro_globals g) {
 
 
 void pack(uint32_t *output, const din *input, int size) {
-    // Fix: allocate the right amount
-    int total_words = (size * 6 + 31) / 32;
-    for (int i = 0; i < total_words; i++) {
+
+    for (int i = 0; i < size * 6 / 32; i++) {
         output[i] = 0;
     }
-    // rest stays the same
+
     for (int i = 0; i < size; i++) {
         const uint8_t tmp = *reinterpret_cast<const uint8_t*>(&input[i]);
         const uint32_t v = static_cast<uint32_t>(tmp & 0x3Fu);
         const int bit_pos = i * 6;
         const int word_idx = bit_pos >> 5;
         const int bit_off = bit_pos & 31;
+
         output[word_idx] |= (v << bit_off);
         const int spill = bit_off + 6 - 32;
         if (spill > 0) {
@@ -212,15 +184,10 @@ int main() {
     dout *h_output = new dout[M * N];
 
     // Calculate sizes for packed FP6 data
-    int total_elements_a = M * K;
-    int total_bits_a = total_elements_a * 6;
-    int total_bytes_a = (total_bits_a + 7) / 8;
-    int total_words_a = (total_bits_a + 31) / 32;
-    
-    int total_elements_b = N * K;
-    int total_bits_b = total_elements_b * 6;
-    int total_bytes_b = (total_bits_b + 7) / 8;
-    int total_words_b = (total_bits_b + 31) / 32;
+    int total_bytes_a = ( M * K * 6 ) / 8;
+    int total_bytes_b = ( N * K * 6 ) / 8;
+    int total_words_a = ( M * K * 6 ) / 32;
+    int total_words_b = ( N * K * 6 ) / 32;
 
     // Allocate packed arrays
     uint32_t *h_input_a_packed = new uint32_t[total_words_a];
@@ -234,8 +201,6 @@ int main() {
     // Initialize with different values
     for (int i = 0; i < M * K; i++) {
         h_input_a[i] = din(dis(gen));
-    }
-    for (int i = 0; i < N * K; i++) {  
         h_input_b[i] = din(dis(gen));
     }
     
