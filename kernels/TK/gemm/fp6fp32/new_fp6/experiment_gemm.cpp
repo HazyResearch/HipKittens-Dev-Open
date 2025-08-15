@@ -272,7 +272,7 @@ int main() {
     // random number generator
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(-0.1f, 0.1f);
+    std::uniform_real_distribution<> dis(-1.0f, 1.0f);
 
     // Initialize with different values
     for (int i = 0; i < M * K; i++) {
@@ -311,14 +311,14 @@ int main() {
 
     // Warmup
     // Warmup
-    const int WARMUP_REPS = 500;
+    const int WARMUP_REPS = 1000;
     for (int r = 0; r < WARMUP_REPS; ++r) { 
         micro_tk<<<globals.grid(), globals.block(), globals.dynamic_shared_memory(), stream>>>(globals);
     }
     hipDeviceSynchronize();
 
     // Timed kernel-only loop
-    const int REPS = 50;
+    const int REPS = 200;
     std::vector<float> times_ms;
     times_ms.reserve(REPS);
     for (int r = 0; r < REPS; ++r) {
