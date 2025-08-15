@@ -15,7 +15,7 @@ struct TimingResult {
 
 // #define DUMP_TO_CSV
 
-#define PROFILE
+// #define PROFILE
 
 #define HipCheckError()    __hipCheckError( __FILE__, __LINE__ )
 inline void __hipCheckError( const char *file, const int line ) {
@@ -191,18 +191,19 @@ TimingResult matmul_ref(const std::vector<fp8e4m3>& a, const std::vector<fp8e4m3
 #endif
 
 template <int M, int N, int K>
-__global__ void matmul_device(const kittens::gl<fp8e4m3, 1, 1, M, K> A, const kittens::gl<fp8e4m3, 1, 1, N, K> B, const kittens::gl<float, 1, 1, M, N> C) {
+__global__ __launch_bounds__(512, 2) void matmul_device(const kittens::gl<fp8e4m3, 1, 1, M, K> A, const kittens::gl<fp8e4m3, 1, 1, N, K> B, const kittens::gl<float, 1, 1, M, N> C) {
     // Each threadblock computes 256x256 output tile
-    constexpr int BLOCK_SIZE = 256;
+    constexpr int BLOCK_SIZE_ROW = 256;
+    constexpr int BLOCK_SIZE_COL = 256;
     constexpr int BLOCK_K = 64;
-    constexpr int blocks_per_row = M / BLOCK_SIZE; // Number of blocks per matrix row
-    constexpr int blocks_per_col = N / BLOCK_SIZE; // Number of blocks per matrix col
+    constexpr int blocks_per_row = M / BLOCK_SIZE_ROW; // Number of blocks per matrix row
+    constexpr int blocks_per_col = N / BLOCK_SIZE_COL; // Number of blocks per matrix col
     constexpr int total_blocks_needed = blocks_per_row * blocks_per_col; // Total blocks needed
     constexpr int k_iters = K / BLOCK_K; // K iterations
 
     // Shared memory tiles: 128x64 for A and B
-    __shared__ st<fp8e4m3, BLOCK_SIZE, BLOCK_K> As;
-    __shared__ st<fp8e4m3, BLOCK_SIZE, BLOCK_K> Bs;
+    __shared__ st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K> As;
+    __shared__ st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K> Bs;
 
     // Register tiles: 64x64 per warp
     rt_fp8e4m3<64, 64> a;
@@ -223,8 +224,8 @@ __global__ void matmul_device(const kittens::gl<fp8e4m3, 1, 1, M, K> A, const ki
         // Convert linear block ID to 2D coordinates
         int block_row = global_block_id / blocks_per_col;
         int block_col = global_block_id % blocks_per_col;
-        int block_m = block_row * BLOCK_SIZE;
-        int block_n = block_col * BLOCK_SIZE;
+        int block_m = block_row * BLOCK_SIZE_ROW;
+        int block_n = block_col * BLOCK_SIZE_COL;
 
         // Warp arrangement within threadblock: 4x2 warps covering 256x256
         int warp_m = (warpid() / 2); // warp row: 0 to 3
