@@ -54,8 +54,8 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
     
     constexpr int elem_per_thread = 16 / sizeof(T);  // 8 if bf16, 16 if fp8
     constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS; // 512 if bf16, 1024 if fp8
-    const int laneid = kittens::laneid() % N_THREADS;
-    const int warp_id = laneid / N_THREADS;
+    const int laneid = kittens::laneid();
+    const int warp_id = warpid();
     const int row_stride = src.template stride<axis>();
 
     constexpr int num_warps = N_THREADS / 64;
