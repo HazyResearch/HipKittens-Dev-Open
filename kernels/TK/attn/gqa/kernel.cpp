@@ -1,6 +1,5 @@
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
-#include "utils.cpp"
 
 constexpr int ATTN_B = 16; // batch size
 constexpr int ATTN_H = 64; // number of heads
@@ -20,7 +19,7 @@ template<int D, typename T=bf16, typename L=row_l> using qo_tile = rt<T, Q_BLOCK
 template<int D, typename T=bf16, typename L=col_l> using qo_tile_transposed = rt<T, D, Q_BLOCK_SIZE, L>;
 template<int D, typename T=bf16, typename L=row_l> using kv_tile = rt<T, KV_BLOCK_SIZE, D, L>;
 template<int D, typename T=bf16, typename L=col_l> using kv_tile_transposed = rt<T, D, KV_BLOCK_SIZE, L>;
-template<int D, typename T=float, typename L=accum_l> using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L>;
+template<int D, typename T=float, typename L=accum_col_l> using attn_tile = rt<T, KV_BLOCK_SIZE, Q_BLOCK_SIZE, L>;
 
 template<int D> struct attn_globals { 
     _gl_QKVO Qg, Kg, Vg, Og; 
@@ -35,7 +34,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row> (&k_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row>, 2>();
-    st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator> (&v_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, 2>();
+    st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col> (&v_smem)[2] = al.allocate<st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, 2>();
     
     const int head_idx = (blockIdx.x % 8) * 8 + (blockIdx.x / 8);
     // const int head_idx = blockIdx.x;
@@ -56,11 +55,11 @@ __global__ void attend_ker(const attn_globals<D> g) {
     kv_tile<D, bf16> k_reg;
     kv_tile_transposed<D, bf16> k_reg_transposed;
 
-    kv_tile<D, bf16, accum_l> v_reg;
-    qo_tile_transposed<D, float, accum_l> o_reg; // Output tile.
-    attn_tile<D, float, accum_l> att_block[2]; // attention tile, in float.
-    attn_tile<D, bf16, accum_l> att_block_bf16;
-    typename attn_tile<D, float, accum_l>::row_vec max_vec, norm_vec, max_vec_prev;
+    kv_tile<D, bf16, accum_col_l> v_reg;
+    qo_tile_transposed<D, float, accum_col_l> o_reg; // Output tile.
+    attn_tile<D, float, accum_col_l> att_block[2]; // attention tile, in float.
+    attn_tile<D, bf16, accum_col_l> att_block_bf16;
+    typename attn_tile<D, float, accum_col_l>::row_vec max_vec, norm_vec, max_vec_prev;
 
     using T = typename st_bf<KV_BLOCK_SIZE, ATTN_D>::dtype;
     constexpr int bytes_per_thread = 16;
@@ -70,7 +69,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     uint32_t swizzled_offsets_V[memcpy_per_tile];
     uint32_t swizzled_offsets_K[memcpy_per_tile];
     prefill_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row>, _gl_QKVO, NUM_THREADS>(k_smem[0], g.Kg, swizzled_offsets_K);
-    prefill_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, NUM_THREADS>(v_smem[0], g.Vg, swizzled_offsets_V);
+    prefill_swizzled_offsets<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, NUM_THREADS>(v_smem[0], g.Vg, swizzled_offsets_V);
 
     load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row>>, NUM_THREADS>(
         k_smem[0], g.Kg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_K);
@@ -90,7 +89,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::row>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::row>>, NUM_THREADS>(
         k_smem[1], g.Kg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_K);
     // All warps then load in the first slice of K (K0)
-    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
         v_smem[0], g.Vg, {batch_idx, 0, head_idx_kv, 0}, swizzled_offsets_V);
     load(k_reg, k_smem[0]);
     swap_layout_and_transpose(k_reg_transposed, k_reg);
@@ -121,7 +120,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
         k_smem[0], g.Kg, {batch_idx, 2, head_idx_kv, 0}, swizzled_offsets_K);
     swap_layout_and_transpose(k_reg_transposed, k_reg);
     // All warps then collaboratively load in the second slice of V (V1) into shared memory 
-    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
         v_smem[1], g.Vg, {batch_idx, 1, head_idx_kv, 0}, swizzled_offsets_V);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -174,7 +173,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
         // Cluster 3:
         //      Load V2 into shared
-        load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+        load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
             v_smem[0], g.Vg, {batch_idx, j - 1, head_idx_kv, 0});
         //      Load K2 into registers
         load(k_reg, k_smem[0]);
@@ -226,7 +225,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
         // Cluster 7:
         //      Load V3 into shared
-        load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+        load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
             v_smem[1], g.Vg, {batch_idx, j, head_idx_kv, 0});
         //      Load K3 into registers
         load(k_reg, k_smem[1]);
@@ -282,7 +281,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
     // Cluster 3:
     //      Load V4 into shared
-    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
         v_smem[0], g.Vg, {batch_idx, num_tiles - 2, head_idx_kv, 0});
     //      Load K4 into registers
     load(k_reg, k_smem[0]);
@@ -330,7 +329,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
     // Cluster 7:
     //      Load V5 into shared
-    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator>>, NUM_THREADS>(
+    load<1, false, st_bf<KV_BLOCK_SIZE, ATTN_D, ducks::st_layout::accumulator_col>, _gl_QKVO, coord<st_bf<KV_BLOCK_SIZE,ATTN_D, ducks::st_layout::accumulator_col>>, NUM_THREADS>(
         v_smem[1], g.Vg, {batch_idx, num_tiles - 1, head_idx_kv, 0});
     //      Load K5 into registers
     load(k_reg, k_smem[1]);
@@ -402,9 +401,9 @@ __global__ void attend_ker(const attn_globals<D> g) {
     }
 
     div_col(o_reg, o_reg, norm_vec);
-    qo_tile<D, float, accum_l> o_reg_transposed;
+    qo_tile<D, float, accum_row_l> o_reg_transposed;
     swap_layout_and_transpose(o_reg_transposed, o_reg);
-    store_transposed(g.Og, o_reg_transposed, {batch_idx, tile_idx, head_idx, 0});
+    store<1, qo_tile<D, float, accum_row_l>, _gl_QKVO, coord<qo_tile<D, float, accum_row_l>>>(g.Og, o_reg_transposed, {batch_idx, tile_idx, head_idx, 0});
 }
 
 template<int D>

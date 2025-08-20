@@ -43,7 +43,7 @@ void micro_tk(const micro_globals g) {
 
     rt_bf<REG_BLOCK_M, DOT_SLICE> A_tile;
     rt_bf<REG_BLOCK_N, DOT_SLICE> B_tile;
-    rt_fl<REG_BLOCK_M, REG_BLOCK_N, ducks::rt_layout::accumulator> C_accum;
+    rt_fl<REG_BLOCK_M, REG_BLOCK_N, ducks::rt_layout::accumulator_col> C_accum;
     zero(C_accum);
 
     // Original WGID.
