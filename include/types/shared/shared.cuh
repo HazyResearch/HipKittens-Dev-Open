@@ -11,6 +11,3 @@
 
 #include "sv.cuh"
 #include "st.cuh"
-
-#include "csv.cuh"
-#include "cst.cuh"

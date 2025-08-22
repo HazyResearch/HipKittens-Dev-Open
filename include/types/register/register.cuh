@@ -10,6 +10,3 @@
 #include "rv.cuh"
 #include "rt.cuh"
 
-#include "crv.cuh"
-#include "crt.cuh"
-
