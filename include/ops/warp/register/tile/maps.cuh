@@ -289,18 +289,21 @@ template<typename op, ducks::rt::row_layout T, ducks::rv::all V>
 __device__ static inline void col_map(T &dst, const T &src, const V &col_values) {
 
     static_assert(std::is_same_v<typename V::layout, typename rt_base<typename T::T, typename T::layout>::row_vec_layout>); // compatible layout
-    static_assert(std::is_same_v<typename V::dtype, typename T::dtype>); // compatible type
+    static_assert(std::is_same_v<typename V::T2, typename T::dtype>); // compatible type
     static_assert(V::outer_dim == T::width); // compatible size
 
+    using dtype_vec = V::dtype;
     using dtype = T::dtype;
 
     #pragma unroll
     for(int j = 0; j < dst.width; j++) {
+        dtype_vec col_val = col_values[j][0];
+        dtype packed_val    = base_types::packing<dtype>::pack(col_val); //  first value in eager mode
         #pragma unroll
         for(int i = 0; i < dst.height; i++) {
             #pragma unroll
             for(int k = 0; k < dst.packed_per_tile; k++) {
-                dst.tiles[i][j].data[k] = op::template op<dtype>(src.tiles[i][j].data[k], col_values[j][k]);
+                dst.tiles[i][j].data[k] = op::template op<dtype>(src.tiles[i][j].data[k], packed_val);
             }
         }
     }
