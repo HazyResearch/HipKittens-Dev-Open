@@ -59,7 +59,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     buffer_resource br = make_buffer_resource(as_u64, buffer_size, 0x00020000);
 
     #pragma unroll
-    for (int z = 0; z < 2; z++) {
+    for (int z = 0; z < REPEAT; z++) {
 
         #pragma unroll
         for(int i = 0; i < dst.height; i++) {
@@ -183,7 +183,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     const int row_offset = 8*(laneid/32), col_offset = laneid%32;
 
     #pragma unroll
-    for (int z = 0; z < 2; z++) {
+    for (int z = 0; z < REPEAT; z++) {
 
         #pragma unroll
         for(int i = 0; i < dst.height; i++) {
@@ -354,7 +354,7 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
 
     int row_offset = laneid%32, col_offset = 8*(laneid/32);
 
-    for (int z = 0; z < 2; z++) {
+    for (int z = 0; z < REPEAT; z++) {
 
         #pragma unroll
         for(int i = 0; i < src.height; i++) {
@@ -440,7 +440,7 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     const int row_offset = 8*(laneid/32), col_offset = laneid%32;
 
     #pragma unroll
-    for (int z = 0; z < 2; z++) {
+    for (int z = 0; z < REPEAT; z++) {
 
         #pragma unroll
         for(int i = 0; i < src.height; i++) {
