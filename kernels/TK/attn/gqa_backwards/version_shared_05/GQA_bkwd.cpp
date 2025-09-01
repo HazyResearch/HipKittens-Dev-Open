@@ -108,16 +108,33 @@ __device__ inline static void atomic_store(const GL &dst, const RT &src, const C
             uint32_t val_3_bits = *reinterpret_cast<const uint32_t*>(&val_3);
 
             asm volatile(
-                "buffer_atomic_add_f32 %0, %1, %8, 0 offen\n"
-                "buffer_atomic_add_f32 %2, %3, %8, 0 offen\n"
-                "buffer_atomic_add_f32 %4, %5, %8, 0 offen\n"
-                "buffer_atomic_add_f32 %6, %7, %8, 0 offen\n"
-                "s_waitcnt vmcnt(0)\n"
+                "buffer_atomic_add_f32 %0, %1, %2, 0 offen\n"
                 :
                 : "v"(val_0_bits), "v"(byte_offset_0),      // %0, %1
-                  "v"(val_1_bits), "v"(byte_offset_1),      // %2, %3
-                  "v"(val_2_bits), "v"(byte_offset_2),      // %4, %5
-                  "v"(val_3_bits), "v"(byte_offset_3),      // %6, %7
+                  "s"(*(i32x4*)&br)                         // %8
+                : "memory"
+            );
+
+            asm volatile(
+                "buffer_atomic_add_f32 %0, %1, %2, 0 offen\n"
+                :
+                : "v"(val_1_bits), "v"(byte_offset_1),      // %2, %3
+                  "s"(*(i32x4*)&br)                         // %8
+                : "memory"
+            );
+
+            asm volatile(
+                "buffer_atomic_add_f32 %0, %1, %2, 0 offen\n"
+                :
+                : "v"(val_2_bits), "v"(byte_offset_2),      // %4, %5
+                  "s"(*(i32x4*)&br)                         // %8
+                : "memory"
+            );
+
+            asm volatile(
+                "buffer_atomic_add_f32 %0, %1, %2, 0 offen\n"
+                : 
+                : "v"(val_3_bits), "v"(byte_offset_3),      // %6, %7
                   "s"(*(i32x4*)&br)                         // %8
                 : "memory"
             );
