@@ -64,37 +64,22 @@ void micro_tk(const micro_globals g) {
     uint32_t swizzled_offsets_B[memcpy_per_tile];
     G::prefill_swizzled_offsets(As[0][0], g.a, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0], g.b, swizzled_offsets_B);
-    __syncthreads(); 
 
     __shared__ int ready[3];      // published epoch per stage (release store)
     __shared__ int done[3];       // number of consumer warps finished with a stage
+    __shared__ int done_epoch[3];  // epoch of last consumer warp to finish with a stage
     __shared__ int prod_cnt[3];   // producer quorum per stage
     const bool warp_leader = (threadIdx.x % kittens::WARP_THREADS) == 0;
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int s=0;s<3;++s) {
-            ready[s]    = 0;
-            done[s]     = NUM_CONSUMER_WORKERS;   // start "free"
+            ready[s] = 0;
+            done[s]       = 0;   
+            done_epoch[s] = 0;  
             prod_cnt[s] = 0;
         }
     }
     __syncthreads();
-
-    auto producers_finish_and_publish = [&](int stage, int epoch) {
-        // finish this warp's LDS writes, then count quorum
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        __threadfence_block();                       // publish LDS to CTA
-      
-        if (warp_leader) atomicAdd(&prod_cnt[stage], 1);
-      
-        if (threadIdx.x == 0) {
-            while (__atomic_load_n(&prod_cnt[stage], __ATOMIC_ACQUIRE) < NUM_PRODUCER_WORKERS)
-                __builtin_amdgcn_s_sleep(4);
-            __threadfence_block();
-            __atomic_store_n(&ready[stage], epoch, __ATOMIC_RELEASE);
-            atomicExch(&prod_cnt[stage], 0);
-        }
-    };
     
     int s = 0, n1 = 1, n2 = 2;
     if (is_producer) {
@@ -103,52 +88,91 @@ void micro_tk(const micro_globals g) {
         for (int m=0; m<M_BLOCK; ++m) G::load<2,false>(As[s][m],  g.a, {0,0, row+m, 0}, swizzled_offsets_A);
         #pragma unroll
         for (int n=0; n<N_BLOCK; ++n) G::load<2,false>(Bs[s][n],  g.b, {0,0, col+n, 0}, swizzled_offsets_B);
-        producers_finish_and_publish(/*stage*/0, /*epoch*/1);
+
+        __builtin_amdgcn_s_waitcnt(0);
+        if (warp_leader) atomicAdd(&prod_cnt[s], 1);
+        if (threadIdx.x == 0) {
+            while (__atomic_load_n(&prod_cnt[s], __ATOMIC_ACQUIRE) < NUM_PRODUCER_WORKERS)
+                __builtin_amdgcn_s_sleep(1);
+            __atomic_store_n(&ready[s], 1, __ATOMIC_RELEASE);
+            atomicExch(&prod_cnt[s], 0); // reset
+        }
+        
         // preload tile 1 into stage n1
         #pragma unroll
         for (int m=0; m<M_BLOCK; ++m) G::load<2,false>(As[n1][m], g.a, {0,0, row+m, 1}, swizzled_offsets_A);
         #pragma unroll
         for (int n=0; n<N_BLOCK; ++n) G::load<2,false>(Bs[n1][n], g.b, {0,0, col+n, 1}, swizzled_offsets_B);
-        producers_finish_and_publish(/*stage*/1, /*epoch*/2);  
+
+        __builtin_amdgcn_s_waitcnt(0);
+        if (warp_leader) atomicAdd(&prod_cnt[n1], 1);
+        if (threadIdx.x == 0) {
+            while (__atomic_load_n(&prod_cnt[n1], __ATOMIC_ACQUIRE) < NUM_PRODUCER_WORKERS)
+                __builtin_amdgcn_s_sleep(1);
+            __atomic_store_n(&ready[n1], 2, __ATOMIC_RELEASE);
+            atomicExch(&prod_cnt[n1], 0); // reset
+        } 
     }
 
     rt_fl<BLOCK_SIZE, BLOCK_SIZE, accum_col_l> C_accum;
     if (is_consumer) {zero(C_accum);}
     const int num_tiles = K / BLOCK_SIZE;
+    #pragma unroll
     for (int tile = 0; tile < num_tiles; ++tile) {
         int s  =  tile      % 3;
         int n2 = (tile + 2) % 3;
         int need_epoch = tile + 1;
+        int next_epoch = tile + 2;
+        int next_next_epoch = tile + 3;
         bool has_next2 = (tile + 2) < num_tiles;
 
         if (is_consumer) {
             while (__atomic_load_n(&ready[s], __ATOMIC_ACQUIRE) < need_epoch)
-                __builtin_amdgcn_s_sleep(4);
+                __builtin_amdgcn_s_sleep(1);
+            
             A_slice a0; B_slice b0;
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[s][consumer_idx],  {0,0}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[s][local_warp_id], {0,0}));
             asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);
+            __builtin_amdgcn_s_setprio(0);
 
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[s][consumer_idx],  {0,1}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[s][local_warp_id], {0,1}));
             asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);
+            __builtin_amdgcn_s_setprio(0);
 
-            if (warp_leader) atomicAdd(&done[s], 1);
+            if (warp_leader) {
+                int v = atomicAdd(&done[s], 1) + 1;
+                if (v == NUM_CONSUMER_WORKERS) {
+                    __atomic_store_n(&done_epoch[s], need_epoch, __ATOMIC_RELEASE);
+                    atomicExch(&done[s], 0);
+                }
+            }
         }
 
         if (is_producer && has_next2) {
-            while (__atomic_load_n(&done[n2], __ATOMIC_ACQUIRE) < NUM_CONSUMER_WORKERS)
-                __builtin_amdgcn_s_sleep(4);
-            if (threadIdx.x == 0) atomicExch(&done[n2], 0);
+            int prev = __atomic_load_n(&ready[n2], __ATOMIC_ACQUIRE);
+            while (__atomic_load_n(&done_epoch[n2], __ATOMIC_ACQUIRE) < prev)
+                __builtin_amdgcn_s_sleep(1);
 
             #pragma unroll
             for (int m=0; m<M_BLOCK; ++m) G::load<2,false>(As[n2][m], g.a, {0,0,row+m,tile+2},  swizzled_offsets_A);
             #pragma unroll
             for (int n=0; n<N_BLOCK; ++n) G::load<2,false>(Bs[n2][n], g.b, {0,0,col+n,tile+2},  swizzled_offsets_B);
 
-            producers_finish_and_publish(n2, tile+3);
+            __builtin_amdgcn_s_waitcnt(0);
+            __threadfence_block();  
+            if (warp_leader) atomicAdd(&prod_cnt[n2], 1);
+            if (threadIdx.x == 0) {
+                while (__atomic_load_n(&prod_cnt[n2], __ATOMIC_ACQUIRE) < NUM_PRODUCER_WORKERS)
+                __builtin_amdgcn_s_sleep(1);
+                __atomic_store_n(&ready[n2], next_next_epoch, __ATOMIC_RELEASE);
+                atomicExch(&prod_cnt[n2], 0);
+            }
         }
     }
 
