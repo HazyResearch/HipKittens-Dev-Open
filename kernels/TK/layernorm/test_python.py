@@ -140,7 +140,7 @@ if max_diff > 0.1:
     print(f"o_resid_tk: ", o_resid_tk[0, 0, :8])
 
 
-
+print(f"If there's a difference, note dropout p is {DROPOUT_P}")
 
 
 
