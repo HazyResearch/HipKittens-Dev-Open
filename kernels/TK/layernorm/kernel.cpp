@@ -4,7 +4,7 @@
 #include "pyutils/pyutils.cuh"
 
 
-constexpr int B = 1;
+constexpr int B = 16;
 constexpr int H = 1;
 constexpr int N = 512;
 constexpr int HEAD_D = 128;
@@ -75,8 +75,6 @@ __global__ void layernorm_tk(const norm_globals<D> g) {
 
     static constexpr int d_model = D;
     using vec_smem_1xD = sv_bf<d_model>;
-    using tile_smem_1xD = st<bf16, 1, d_model>;
-    using tile_reg_1xD = rt_bf<1, d_model>;
 
     vec_smem_1xD (&x_s)           [2][NUM_WORKERS] = al.allocate<vec_smem_1xD,2,NUM_WORKERS>();
     vec_smem_1xD (&residual_s)    [2][NUM_WORKERS] = al.allocate<vec_smem_1xD,2,NUM_WORKERS>();  
@@ -95,8 +93,8 @@ __global__ void layernorm_tk(const norm_globals<D> g) {
     bf16 mean = __float2bfloat16(0.0f);
     bf16 var  = __float2bfloat16(0.0f);      
 
-    load(x_s[warpid][tic], g.x, {batch, 0, seq_start+warpid, 0});
-    load(residual_s[warpid][tic], g.residual, {batch, 0, seq_start+warpid, 0});
+    load(x_s[warpid][tic], g.x, {0, batch, 0, seq_start+warpid});
+    load(residual_s[warpid][tic], g.residual, {0, batch, 0, seq_start+warpid});
     __syncthreads();
     
     int n_blocks = g.n_per_tile/NUM_WORKERS; 
@@ -106,14 +104,14 @@ __global__ void layernorm_tk(const norm_globals<D> g) {
 
         // kick off load for the next block
         if( block < n_blocks - 1 ) {
-            load(x_s[warpid][toc], g.x, {batch, 0, seq_start+next_idx, 0});
-            load(residual_s[warpid][toc], g.residual, {batch, 0, seq_start+next_idx, 0});
+            load(x_s[warpid][toc], g.x, {0, batch, 0, seq_start+next_idx});
+            load(residual_s[warpid][toc], g.residual, {0, batch, 0, seq_start+next_idx});
         }
         __syncthreads();
 
         dropout_mask(x_s[warpid][tic], g.dropout_p); 
         add(residual_s[warpid][tic], residual_s[warpid][tic], x_s[warpid][tic]);    
-        store(g.o_resid, residual_s[warpid][tic], {batch, 0, seq_start+cur_idx, 0});
+        store(g.o_resid, residual_s[warpid][tic], {0, batch, 0, seq_start+cur_idx});
         __syncthreads();
 
         sum(mean, residual_s[warpid][tic]);
@@ -131,7 +129,7 @@ __global__ void layernorm_tk(const norm_globals<D> g) {
         __syncthreads();
 
         // save output
-        store(g.o, residual_s[warpid][tic], {batch, 0, seq_start+cur_idx, 0});
+        store(g.o, residual_s[warpid][tic], {0, batch, 0, seq_start+cur_idx});
     }
 }
 

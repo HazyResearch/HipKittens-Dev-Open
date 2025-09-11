@@ -7,7 +7,7 @@ import math
 import tk_kernel
 import time
 
-B = 1
+B = 16
 N = 512
 D = 128
 
