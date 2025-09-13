@@ -54,14 +54,14 @@ __device__ inline void apply_rotary_embedding(reg_tile_1xFULL_ROPE_D &x_reg,
     
     int half_dim_tiles = half_rope_dim / BLOCK_SIZE;  // Should be 1 for D=64
 
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
+    // __builtin_amdgcn_s_waitcnt(0);
+    // __builtin_amdgcn_s_barrier();
 
-    int condition = (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0);
-    if (condition) {
-        printf("half_dim_tiles: %d\n", half_dim_tiles);
-        printf("reg_tile_1xHALF_ROPE_D::packed_per_thread: %d\n", reg_tile_1xHALF_ROPE_D::packed_per_thread);
-    }
+    // int condition = (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0);
+    // if (condition) {
+    //     printf("half_dim_tiles: %d\n", half_dim_tiles);
+    //     printf("reg_tile_1xHALF_ROPE_D::packed_per_thread: %d\n", reg_tile_1xHALF_ROPE_D::packed_per_thread);
+    // }
     
     // Copy first half and second half
     for(int i = 0; i < half_dim_tiles; i++) {
@@ -127,6 +127,7 @@ __global__ void _fused_rotary(const rotary_globals<D> g) {
         load(sin_s, g.sin, {0, 0, block, 0});
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
         // Load from shared memory to registers
         reg_tile_1xFULL_ROPE_D x_reg;
@@ -137,12 +138,10 @@ __global__ void _fused_rotary(const rotary_globals<D> g) {
         load(sin_reg, sin_s);
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_s_barrier();
-        __syncthreads();
+        __builtin_amdgcn_sched_barrier(0);
 
         // Apply rotary embedding
         apply_rotary_embedding<D>(x_reg, cos_reg, sin_reg);
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_s_barrier();
 
         // Store result back to global memory
         store(g.o, x_reg, {b, h, block, 0});
