@@ -434,6 +434,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -447,8 +449,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             // 16. dK_j += dS_ij^T @ Q_i   (128x64)=(128x16)x(16x64)
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -526,6 +526,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -537,8 +539,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -614,6 +614,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -625,8 +627,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -702,6 +702,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -713,8 +715,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -806,6 +806,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -817,8 +819,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -895,6 +895,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -906,8 +908,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -983,6 +983,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -994,8 +996,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -1071,6 +1071,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             zero(dP_ij);
             mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+            mul(dP_ij, dP_ij, scale_factor);
+            sub_row(dP_ij, dP_ij, delta_i);
             __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -1082,8 +1084,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
-            mul(dP_ij, dP_ij, scale_factor);
-            sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
             swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -1167,6 +1167,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         zero(dP_ij);
         mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
         mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+        mul(dP_ij, dP_ij, scale_factor);
+        sub_row(dP_ij, dP_ij, delta_i);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1178,8 +1180,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        mul(dP_ij, dP_ij, scale_factor);
-        sub_row(dP_ij, dP_ij, delta_i);
         mul(dP_ij, dP_ij, P_ij);
         copy(dP_ij_bf16, dP_ij);
         swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -1254,6 +1254,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         zero(dP_ij);
         mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
         mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+        mul(dP_ij, dP_ij, scale_factor);
+        sub_row(dP_ij, dP_ij, delta_i);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1265,8 +1267,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        mul(dP_ij, dP_ij, scale_factor);
-        sub_row(dP_ij, dP_ij, delta_i);
         mul(dP_ij, dP_ij, P_ij);
         copy(dP_ij_bf16, dP_ij);
         swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -1341,6 +1341,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         zero(dP_ij);
         mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
         mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+        mul(dP_ij, dP_ij, scale_factor);
+        sub_row(dP_ij, dP_ij, delta_i);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1352,8 +1354,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        mul(dP_ij, dP_ij, scale_factor);
-        sub_row(dP_ij, dP_ij, delta_i);
         mul(dP_ij, dP_ij, P_ij);
         copy(dP_ij_bf16, dP_ij);
         swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
@@ -1428,6 +1428,8 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         zero(dP_ij);
         mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
         mma_ABt(dP_ij, dO_i, V_j, dP_ij);
+        mul(dP_ij, dP_ij, scale_factor);
+        sub_row(dP_ij, dP_ij, delta_i);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1439,8 +1441,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        mul(dP_ij, dP_ij, scale_factor);
-        sub_row(dP_ij, dP_ij, delta_i);
         mul(dP_ij, dP_ij, P_ij);
         copy(dP_ij_bf16, dP_ij);
         swap_layout_and_transpose(dP_ij_bf16_accum_row, dP_ij_bf16);
