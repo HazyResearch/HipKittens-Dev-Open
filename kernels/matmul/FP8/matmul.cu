@@ -610,7 +610,7 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_sched_barrier(0);
         {
-            load_gl_to_st<2, false, kittens::ducks::rt_layout::row, ST_A, kittens::gl<fp8e4m3, 1, 1, M, K>, coord<ST_A>, NUM_WARPS*WARP_THREADS>(As[curr][0], A, {0, 0, block_row*WARPS_ROW, k + 2});
+            // load_gl_to_st<2, false, kittens::ducks::rt_layout::row, ST_A, kittens::gl<fp8e4m3, 1, 1, M, K>, coord<ST_A>, NUM_WARPS*WARP_THREADS>(As[curr][0], A, {0, 0, block_row*WARPS_ROW, k + 2});
             auto& dst_gl = As[curr][0];
             using ST_GL = ST_A;
             using GL_GL = GL_A;
@@ -628,19 +628,14 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
             constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS; // 512 if bf16, 1024 if fp8
             const int laneid = kittens::laneid();
             const int warp_id = warpid();
-            const int row_stride = src_gl.template stride<axis>();
+            const int row_stride_gl = src_gl.template stride<axis>();
 
             constexpr int num_warps = N_THREADS / 64;
 
             coord<> unit_coord = idx.template unit_coord<axis, 3>();
             T_GL* global_ptr = (T_GL*)&src_gl[unit_coord];
-            i32x4 srsrc = make_srsrc(global_ptr, row_stride * ST_GL::rows * sizeof(T_GL));
+            i32x4 srsrc = make_srsrc(global_ptr, row_stride_gl * ST_GL::rows * sizeof(T_GL));
             const T_GL* lds_base = &dst_gl.data[0] + (warp_id * elem_per_warp);
-
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(0, lds_base, srsrc, row_stride);
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(1, lds_base, srsrc, row_stride);
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(2, lds_base, srsrc, row_stride);
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(3, lds_base, srsrc, row_stride);
 
             {
                 // auto b_subtile_1 = kittens::subtile_inplace<BLOCK_SIZE_COL / 2 / WARPS_COL, k_step>(Bs[curr][1], {warp_n, 0}, true);
@@ -675,6 +670,8 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                 addr1 ^= (((addr1 % (256*8)) >> 8) << 4);
 
                 {
+
+                    buffer_load_lds<T_GL, ST_GL, N_THREADS>(0, lds_base, srsrc, row_stride_gl);
                     constexpr int i = 0;
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -682,6 +679,9 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr0), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 0, 0);
+                    __builtin_amdgcn_s_setprio(0);
 
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -689,8 +689,12 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr1), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 1, 0);
+                    __builtin_amdgcn_s_setprio(0);
                 }
                 {
+                    buffer_load_lds<T_GL, ST_GL, N_THREADS>(1, lds_base, srsrc, row_stride_gl);
                     constexpr int i = 1;
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -698,6 +702,10 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr0), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 2, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 3, 0);
+                    __builtin_amdgcn_s_setprio(0);
 
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -705,8 +713,13 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr1), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 0, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 1, 0);
+                    __builtin_amdgcn_s_setprio(0);
                 }
                 {
+                    buffer_load_lds<T_GL, ST_GL, N_THREADS>(2, lds_base, srsrc, row_stride_gl);
                     constexpr int i = 2;
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -714,6 +727,10 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr0), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 2, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 3, 0);
+                    __builtin_amdgcn_s_setprio(0);
 
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -721,8 +738,13 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr1), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 0, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 1, 0);
+                    __builtin_amdgcn_s_setprio(0);
                 }
                 {
+                    buffer_load_lds<T_GL, ST_GL, N_THREADS>(3, lds_base, srsrc, row_stride_gl);
                     constexpr int i = 3;
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -730,6 +752,10 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr0), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 2, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 3, 0);
+                    __builtin_amdgcn_s_setprio(0);
 
                     asm volatile(
                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -737,27 +763,14 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
                         : "v"(addr1), "i"(i * row_stride)
                         : "memory"
                     );
+                    __builtin_amdgcn_s_setprio(1);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 0, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 1, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 2, 0);
+                    mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 3, 0);
+                    __builtin_amdgcn_s_setprio(0);
                 }
             }
-
-            __builtin_amdgcn_s_setprio(1);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 0, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 1, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 2, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 0, 3, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 0, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 1, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 2, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 1, 3, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 0, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 1, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 2, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 2, 3, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 0, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 1, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 2, 0);
-            mma_ABt_base_wrapper(c[0][0], a[0], b[0], c[0][0], 3, 3, 0);
-            __builtin_amdgcn_s_setprio(0);
         }
 
         __builtin_amdgcn_sched_barrier(0);
