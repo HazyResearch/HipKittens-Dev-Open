@@ -24,6 +24,7 @@ struct rt_shape {
     static constexpr int stride = _stride;
     static constexpr int num_elements = rows*cols;
     static constexpr int elements_per_thread = num_elements / kittens::WARP_THREADS;
+    static constexpr int num_strides = elements_per_thread / stride;
 };
 
 using rt_16x16 = rt_shape<16, 16, 4>;

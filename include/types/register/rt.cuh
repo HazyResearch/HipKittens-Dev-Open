@@ -68,9 +68,16 @@ struct rt {
     static_assert(cols % rt_base<T, layout, shape>::cols == 0, "Columns must be divisible by the tile size");
     static constexpr int height              = rows / rt_base<T, layout, shape>::rows; ///< Height in subtiles.
     static constexpr int width               = cols / rt_base<T, layout, shape>::cols; ///< Width in subtiles.
+
+    // Base tile attributes
     static constexpr int base_tile_rows        = rt_base<T, layout, shape>::rows;        ///< Size of the base tile.
     static constexpr int base_tile_cols        = rt_base<T, layout, shape>::cols;        ///< Size of the base tile.
     static constexpr int base_tile_stride      = rt_base<T, layout, shape>::stride;      ///< Stride of the base tile.
+    static constexpr int base_tile_num_strides = rt_base<T, layout, shape>::num_strides; ///< Number of strides per base tile.
+    static constexpr int base_tile_reductions = rt_base<T, layout, shape>::reductions;
+    static constexpr int base_tile_threads_per_reduction = rt_base<T, layout, shape>::threads_per_reduction;
+    static constexpr int base_tile_elements_per_stride_group = rt_base<T, layout, shape>::elements_per_stride_group;
+
     static constexpr int num_elements        = rt_base<T, layout, shape>::num_elements        * width * height; ///< Total number of elements.
     static constexpr int elements_per_thread = rt_base<T, layout, shape>::elements_per_thread * width * height; ///< Elements handled per thread.
     static constexpr int packed_per_thread   = rt_base<T, layout, shape>::packed_per_thread   * width * height; ///< Packed elements per thread.

@@ -61,6 +61,11 @@ template<typename _T, ducks::rt_layout::all _layout, ducks::rt_shape::all _shape
     static constexpr int stride = _shape::stride;
     static constexpr int num_elements = _shape::num_elements;
     static constexpr int elements_per_thread = _shape::elements_per_thread;
+    static constexpr int num_strides = _shape::num_strides;
+
+    static constexpr int reductions = std::is_same_v<layout, ducks::rt_layout::row> ? cols : rows;
+    static constexpr int threads_per_reduction = reductions / elements_per_thread;
+    static constexpr int elements_per_stride_group = threads_per_reduction * stride;
 
     static_assert(num_elements % stride == 0, "num_elements must be divisible by stride");
 
