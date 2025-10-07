@@ -172,24 +172,24 @@ __device__ inline static void store(ST &dst, const RT &src) {
 
     const int laneid = kittens::laneid();
 
-    const int row_offset = laneid % dst.base_tile_rows;
-    const int col_offset = dst.base_tile_stride * (laneid / dst.base_tile_rows);
+    const int row_offset = laneid % src.base_tile_rows;
+    const int col_offset = src.base_tile_stride * (laneid / src.base_tile_rows);
 
     const uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
 
     #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
-        const int row = i * dst.base_tile_rows + row_offset;
+    for(int i = 0; i < src.height; i++) {
+        const int row = i * src.base_tile_rows + row_offset;
 
         #pragma unroll
-        for(int j = 0; j < dst.width; j++) {
+        for(int j = 0; j < src.width; j++) {
 
             #pragma unroll
-            for (int k = 0; k < dst.base_tile_num_strides; k++) {
-                const int col = j * dst.base_tile_cols + col_offset + k * dst.base_tile_elements_per_stride_group;
+            for (int k = 0; k < src.base_tile_num_strides; k++) {
+                const int col = j * src.base_tile_cols + col_offset + k * src.base_tile_elements_per_stride_group;
                 const uint32_t addr = dst.idx(dst_ptr, {row, col});
 
-                int idx = k * dst.base_tile_stride / packing;
+                int idx = k * src.base_tile_stride / packing;
 
                 if constexpr (std::is_same_v<U2, bf16_2>) {
 
