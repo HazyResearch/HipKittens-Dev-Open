@@ -696,11 +696,14 @@ __device__ inline static void store(ST &dst, const RT &src) {
                         // Use ds_write_b128 for stride == 8, dtype == bf16
                         if constexpr (RT::base_tile_stride == 8) {
                             asm volatile(
-                                "ds_write_b128 %0, %1 offset:%2\n"
+                                "ds_write_b64 %0, %1 offset:%3\n"
+                                "ds_write_b64 %0, %2 offset:%4\n"
                                 : 
                                 : "v"(addr), 
                                     "v"(*reinterpret_cast<const float2*>(&src.tiles[i][j].data[idx])),
-                                    "i"(offset)
+                                    "v"(*reinterpret_cast<const float2*>(&src.tiles[i][j].data[idx + 2])),
+                                    "i"(offset),
+                                    "i"(offset + 8)
                             );
                         // Use ds_write_b64 for stride == 4, dtype == bf16
                         } else if constexpr (RT::base_tile_stride == 4) {
