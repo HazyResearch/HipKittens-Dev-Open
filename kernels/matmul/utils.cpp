@@ -30,7 +30,7 @@ __device__ inline void buffer_load_lds(int i, const T* lds_base, i32x4 srsrc, in
         offset_in_global,
         0, 
         0, // instruction offset
-        static_cast<index_t>(coherency::cache_all)); // cache coherency
+        static_cast<int>(coherency::cache_all)); // cache coherency
 }
 
 template<int axis, bool assume_aligned,
@@ -81,7 +81,7 @@ __device__ inline void load_gl_to_st(ST& dst, const GL& src, const COORD& idx)
             offset_in_global,
             0, 
             0, // instruction offset
-            static_cast<index_t>(coherency::cache_all)); // cache coherency
+            static_cast<int>(coherency::cache_all)); // cache coherency
     }
 }
 
@@ -159,7 +159,7 @@ __device__ inline void load_gl_to_st(ST& dst, const GL& src, const COORD& idx, c
             swizzled_offsets[i],
             0, 
             0, // instruction offset
-            static_cast<index_t>(coherency::cache_all)); // cache coherency
+            static_cast<int>(coherency::cache_all)); // cache coherency
     }
 }
 
@@ -184,8 +184,8 @@ __device__ inline void mma_ABt_base_wrapper(D& d_mma, const A& a_mma, const B& b
 template<ducks::rt::all RT, ducks::st::all ST>
 __device__ inline static void load_st_to_rt(RT &dst, const ST &src) {
 
-    static_assert(RT::height == ST::height, "register tile and shared tile must match height");
-    static_assert(RT::width  == ST::width,  "register tile and shared tile must match width");
+    static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
+    static_assert(RT::cols  == ST::cols,  "register tile and shared tile must match cols");
 
     using T2 = RT::dtype;
     using T  = base_types::packing<T2>::unpacked_type;
@@ -194,20 +194,22 @@ __device__ inline static void load_st_to_rt(RT &dst, const ST &src) {
     static_assert(sizeof(U) == 2 || sizeof(U) == 1, "only supporting 16 and 8-bit dtypes");
     static_assert((!std::is_same_v<T, fp8e4m3>) || std::is_same_v<U, T>, "global and shared tile must have the same dtype if fp8");
 
-    constexpr int subtile_stride = kittens::TILE_COL_DIM<U> * sizeof(U) / 2;
+    constexpr int subtile_stride = RT::base_tile_cols * sizeof(U) / 2;
     const int tile_stride = subtile_stride * 2;
-    constexpr int row_stride = TILE_ROW_DIM<U> * ST::underlying_cols * sizeof(U);
+    constexpr int row_stride = RT::base_tile_rows * ST::underlying_cols * sizeof(U);
 
     const int elem_per_thread = 16 / sizeof(U); // 8 if bf16, 16 if fp8e4m3
-    uint32_t st_offset = (laneid() % TILE_ROW_DIM<U>) * ST::underlying_width * TILE_COL_DIM<U> + (laneid() / TILE_ROW_DIM<U> * 16 / sizeof(U));
+    uint32_t st_offset = (laneid() % RT::base_tile_rows) * ST::underlying_cols + (laneid() / RT::base_tile_rows * 16 / sizeof(U));
     uint32_t base_addr = reinterpret_cast<uintptr_t>(&src.data[st_offset]);
     uint32_t addr0 = base_addr;
     addr0 ^= (((addr0 % (256*8)) >> 8) << 4);
     uint32_t addr1 = base_addr + subtile_stride;
     addr1 ^= (((addr1 % (256*8)) >> 8) << 4);
 
+    constexpr int num_rts = RT::rows / RT::base_tile_rows;
+
     #pragma unroll
-    for(int i = 0; i < dst.height; i++) {
+    for(int i = 0; i < num_rts; i++) {
 
         // tile 0
         asm volatile(

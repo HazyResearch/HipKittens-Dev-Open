@@ -136,6 +136,6 @@ concept col_layout = all<T> && std::is_same_v<typename T::layout, ducks::rt_layo
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_fl = rt<float, _r, _c, layout, shape>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_bf = rt<bf16,  _r, _c, layout, shape>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_hf = rt<half,  _r, _c, layout, shape>;
-// TODO: fp8e4m3 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fp8e4m3 = rt<fp8e4m3, _r, _c, layout>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x128> using rt_fp8e4m3 = rt<fp8e4m3, _r, _c, layout, shape>;
 
 } // namespace kittens

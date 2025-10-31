@@ -179,10 +179,10 @@ __device__ static inline void mma_AB_base(rt_base<float, ducks::rt_layout::col, 
  * @param[in] b The second input rt_base<bf16_2, row_layout> matrix in row-major mode.
  * @param[in] c The input rt_base<float2, row_layout> accumulator matrix.
  */
-template<ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape>
+template<ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T=bf16>
 __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col, D_shape> &d,
-    const rt_base<bf16, ducks::rt_layout::row, A_shape> &a,
-    const rt_base<bf16, ducks::rt_layout::row, B_shape> &b, // in row-major mode
+    const rt_base<MM_Operand_T, ducks::rt_layout::row, A_shape> &a,
+    const rt_base<MM_Operand_T, ducks::rt_layout::row, B_shape> &b, // in row-major mode
     const rt_base<float, ducks::rt_layout::col, C_shape> &c) {
 
     static_assert(std::is_same_v<D_shape, C_shape>, "D and C must have the same shape");
@@ -195,18 +195,27 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
     constexpr int A_stride = A_shape::stride;
     constexpr int B_stride = B_shape::stride;
     static_assert(A_stride == B_stride, "A and B must have the same stride");
-    
-    // TODO: fp8e4m3
-    if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> && 
+
+    if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
                   A_rows == 16 && A_cols == 32 &&
                   B_rows == 16 && B_cols == 32 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
         mfma161632(d.data, a.data, b.data, c.data);
-    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> && 
+    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> &&
                   A_rows == 32 && A_cols == 16 &&
                   B_rows == 32 && B_cols == 16 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32>) {
         mfma323216(d.data, a.data, b.data, c.data);
+    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
+                  A_rows == 16 && A_cols == 128 &&
+                  B_rows == 16 && B_cols == 128 &&
+                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
+        mfma1616128(d.data, a.data, b.data, c.data);
+    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> &&
+                  A_rows == 32 && A_cols == 64 &&
+                  B_rows == 32 && B_cols == 64 &&
+                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32>) {
+        mfma323264(d.data, a.data, b.data, c.data);
     } else {
         static_assert(false, "Unsupported shape combination");
     }
