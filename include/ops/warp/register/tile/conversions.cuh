@@ -13,182 +13,6 @@ namespace kittens {
 /* ----------  LAYOUT SWAPS  ---------- */
 
 /**
- * @brief Swaps the layout of a register base tile.
- *
- * This function swaps the layout of a register base tile by performing a series of layout swaps
- * on its constituent bf16_2 elements. It is used to change the data layout within a register tile.
- *
- * @tparam T2 The data type of the register tile elements.
- * @tparam layout The current layout of the register tile.
- * @param dst[out] Reference to the destination register base tile where the result will be stored.
- * @param src[in] Reference to the source register base tile to be swapped.
- */
-// template<ducks::rt_layout::all layout1, typename matrix_layout1, typename T, ducks::rt_layout::all layout2, typename matrix_layout2>
-// __device__ inline void swap_layout(rt_base<T, layout1, matrix_layout1> &dst, const rt_base<T, layout2, matrix_layout2> &src) {
-
-//     static_assert(false, "Unsupported layout swap");
-
-//     // // same layout
-//     // if constexpr (std::is_same_v<layout1, layout2>) { // just a simple copy
-//     //     #pragma unroll
-//     //     for(int i = 0; i < dst.packed_per_thread; i++) {
-//     //         dst.data[i] = src.data[i];
-//     //     }
-//     // }
-//     // // accumulator <-> regular
-//     // else if constexpr (std::is_same_v<layout1, typename ducks::rt_layout::shuffle<layout2>::type>) {
-//     //     if constexpr (std::is_same_v<T, bf16>) {
-//     //         uint32_t* src_ptr = (uint32_t*)&src.data[0];
-//     //         uint32_t* dst_ptr = (uint32_t*)&dst.data[0];
-            
-//     //         // Load source values
-//     //         uint32_t temp0 = src_ptr[0], temp1 = src_ptr[1], temp2 = src_ptr[2], temp3 = src_ptr[3];
-//     //         uint32_t temp4 = src_ptr[4], temp5 = src_ptr[5], temp6 = src_ptr[6], temp7 = src_ptr[7];
-            
-//     //         // Try using single calls with immediate access to avoid bound_ctrl
-//     //         // This should generate e32 instead of e64
-//     //         dst_ptr[0] = __builtin_amdgcn_permlane32_swap(temp0, temp2, false, false)[0];
-//     //         dst_ptr[1] = __builtin_amdgcn_permlane32_swap(temp1, temp3, false, false)[0];
-//     //         dst_ptr[4] = __builtin_amdgcn_permlane32_swap(temp4, temp6, false, false)[0];
-//     //         dst_ptr[5] = __builtin_amdgcn_permlane32_swap(temp5, temp7, false, false)[0];
-            
-//     //         // For the second elements, use the swap result from the same lanes but different element
-//     //         dst_ptr[2] = __builtin_amdgcn_permlane32_swap(temp0, temp2, false, false)[1];
-//     //         dst_ptr[3] = __builtin_amdgcn_permlane32_swap(temp1, temp3, false, false)[1];
-//     //         dst_ptr[6] = __builtin_amdgcn_permlane32_swap(temp4, temp6, false, false)[1];
-//     //         dst_ptr[7] = __builtin_amdgcn_permlane32_swap(temp5, temp7, false, false)[1];
-//     //     }
-//     //     else {
-//     //         // Keep original for other types
-    
-//     //         T src_tmp[16] = {
-//     //             src.data[0].x, src.data[0].y,
-//     //             src.data[1].x, src.data[1].y,
-//     //             src.data[2].x, src.data[2].y,
-//     //             src.data[3].x, src.data[3].y,
-//     //             src.data[4].x, src.data[4].y,
-//     //             src.data[5].x, src.data[5].y,
-//     //             src.data[6].x, src.data[6].y,
-//     //             src.data[7].x, src.data[7].y,
-//     //         };
-    
-//     //         T dst_tmp[16];
-//     //         #pragma unroll
-//     //         for(int k = 0; k < 8; k++) {
-//     //             const int kk = (k / 4) * 8 + (k % 4);
-//     //             if constexpr (std::is_same_v<T, float>) {
-//     //                 uint2_t res = __builtin_amdgcn_permlane32_swap(__float_as_uint(src_tmp[kk]), __float_as_uint(src_tmp[kk + 4]), false, true);
-//     //                 dst_tmp[kk] = __uint_as_float(res.x);
-//     //                 dst_tmp[kk + 4] = __uint_as_float(res.y);
-//     //             }
-//     //             else if constexpr (std::is_same_v<T, half>) {
-//     //                 uint2_t res = __builtin_amdgcn_permlane32_swap(__half_as_ushort(src_tmp[kk]), __half_as_ushort(src_tmp[kk + 4]), false, true);
-//     //                 dst_tmp[kk] = __ushort_as_half(res.x);
-//     //                 dst_tmp[kk + 4] = __ushort_as_half(res.y);
-//     //             }
-//     //         }
-//     //         memcpy(&dst.data[0], &dst_tmp[0], sizeof(dst.data));
-//     //     }
-//     // }
-//     // // row <-> col
-//     // else if constexpr ((std::is_same_v<layout2, ducks::rt_layout::row> || std::is_same_v<layout2, ducks::rt_layout::col>) && std::is_same_v<layout1, typename ducks::rt_layout::transpose<layout2>::type>) {
-//     //     int lane = laneid();
-
-//     //     int to_flip = ((lane % 32) / 16) * 8;
-//     //     int or_not_to_flip = ((lane % 32) / 16) * 16;
-//     //     int block_src_trans = 32*((lane%16)/8) + 8*(lane/32); 
-//     //     int block_offset = lane%8; 
-    
-//     //     T src_tmp[16] = {
-//     //         src.data[0].x, src.data[0].y,
-//     //         src.data[1].x, src.data[1].y,
-//     //         src.data[2].x, src.data[2].y,
-//     //         src.data[3].x, src.data[3].y,
-//     //         src.data[4].x, src.data[4].y,
-//     //         src.data[5].x, src.data[5].y,
-//     //         src.data[6].x, src.data[6].y,
-//     //         src.data[7].x, src.data[7].y,
-//     //     };
-    
-//     //     T dst_tmp[16];
-//     //     #pragma unroll
-//     //     for(int k = 0; k < 16; k++) {
-//     //         int that_is_the_question = (k / 8) * 24;
-//     //         if constexpr (std::is_same_v<T, bf16>) {
-//     //             dst_tmp[block_offset^k^to_flip] = __float2bfloat16(__shfl(__bfloat162float(src_tmp[block_offset^k^to_flip]), (block_src_trans + block_offset^k^or_not_to_flip^that_is_the_question)));
-//     //         }
-//     //         else {
-//     //             dst_tmp[block_offset^k^to_flip] = __shfl(src_tmp[block_offset^k^to_flip], block_src_trans + block_offset^k^or_not_to_flip^that_is_the_question);
-//     //         }
-//     //     }
-    
-//     //     dst.data[0].x = dst_tmp[0];
-//     //     dst.data[0].y = dst_tmp[1];
-//     //     dst.data[1].x = dst_tmp[2];
-//     //     dst.data[1].y = dst_tmp[3];
-//     //     dst.data[2].x = dst_tmp[4];
-//     //     dst.data[2].y = dst_tmp[5];
-//     //     dst.data[3].x = dst_tmp[6];
-//     //     dst.data[3].y = dst_tmp[7];
-//     //     dst.data[4].x = dst_tmp[8];
-//     //     dst.data[4].y = dst_tmp[9];
-//     //     dst.data[5].x = dst_tmp[10];
-//     //     dst.data[5].y = dst_tmp[11];
-//     //     dst.data[6].x = dst_tmp[12];
-//     //     dst.data[6].y = dst_tmp[13];
-//     //     dst.data[7].x = dst_tmp[14];
-//     //     dst.data[7].y = dst_tmp[15];
-//     // }
-//     // // shuffle(transpose(accumulator))
-//     // else if constexpr ((std::is_same_v<layout2, ducks::rt_layout::accumulator_col> || std::is_same_v<layout2, ducks::rt_layout::accumulator_row>) && std::is_same_v<layout1, typename ducks::rt_layout::shuffle<typename ducks::rt_layout::transpose<layout2>::type>::type>) {
-//     //     const int lane = laneid();
-
-//     //     int block_src_trans = 32*((lane%8)/4) + 8*(lane/32); 
-//     //     int thread_offset = lane % 4;
-//     //     int block_offset = ((lane % 16) / 8) * 4;
-//     //     int send_offset = ((lane % 8) / 4) * 4;
-//     //     int to_flip = ((lane % 32) / 16) * 8;
-//     //     int or_not_to_flip = ((lane % 32) / 16) * 16;
-        
-    
-//     //     T src_tmp[16] = {
-//     //         src.data[0].x, src.data[0].y,
-//     //         src.data[1].x, src.data[1].y,
-//     //         src.data[2].x, src.data[2].y,
-//     //         src.data[3].x, src.data[3].y,
-//     //         src.data[4].x, src.data[4].y,
-//     //         src.data[5].x, src.data[5].y,
-//     //         src.data[6].x, src.data[6].y,
-//     //         src.data[7].x, src.data[7].y,
-//     //     };
-    
-//     //     T dst_tmp[16];
-//     //     #pragma unroll
-//     //     for(int k = 0; k < 16; k++) {
-//     //         if constexpr (std::is_same_v<T, bf16>) {
-//     //             int that_is_the_question = (k / 8) * 24;
-//     //             int setting = thread_offset^block_offset^k^to_flip;
-//     //             int sending = thread_offset^send_offset^k^to_flip;
-//     //             int from = block_src_trans + thread_offset^block_offset^k^or_not_to_flip^that_is_the_question;
-//     //             dst_tmp[setting] = __float2bfloat16(__shfl(__bfloat162float(src_tmp[sending]), from));
-//     //         }
-//     //         else {
-//     //             int that_is_the_question = (k / 8) * 24;
-//     //             int setting = thread_offset^block_offset^k^to_flip;
-//     //             int sending = thread_offset^send_offset^k^to_flip;
-//     //             int from = block_src_trans + thread_offset^block_offset^k^or_not_to_flip^that_is_the_question;
-//     //             dst_tmp[setting] = __shfl(src_tmp[sending], from);
-//     //         }
-//     //     }
-        
-//     //     memcpy(&dst.data[0], &dst_tmp[0], sizeof(dst.data));
-//     // }
-//     // else {
-//     //     static_assert(false, "Unsupported layout swap");
-//     // }
-// }
-
-/**
  * @brief Swaps the layout of a register tile.
  *
  * This function swaps the layout of a register tile by iterating over its height and width
@@ -204,56 +28,50 @@ namespace kittens {
 template<ducks::rt_layout::all layout1, ducks::rt_shape::all shape1, typename T, int _height, int _width, ducks::rt_layout::all layout2, ducks::rt_shape::all shape2>
 __device__ static inline void swap_layout(rt<T, _height, _width, layout1, shape1> &dst, const rt<T, _height, _width, layout2, shape2> &src) {
 
-    if constexpr (std::is_same_v<shape1, typename ducks::rt_shape::rt_16x32> && std::is_same_v<shape2, typename ducks::rt_shape::rt_16x16>) {
-
+    if constexpr (std::is_same_v<T, bf16>) {
         if constexpr (std::is_same_v<layout1, typename ducks::rt_layout::col> && std::is_same_v<layout2, typename ducks::rt_layout::col>) {
             // src consists of 16x16 tiles while dst consists of 16x32 tiles.
             // the reduction dimension (rows) stays the same, while the column dimension (cols) is doubled.
             // For every two 16x16 tiles in src along the (width) axis, we fill one 16x32 tile in dst along the (width) axis.
             // To do this for bf16, we issue 4 v_permlane16_swap instructions.
-            static_assert(std::is_same_v<T, bf16>, "only supports bf16");
-
-            #pragma unroll
-            for (int i = 0; i < dst.height; i++) {
+            if constexpr (std::is_same_v<shape1, typename ducks::rt_shape::rt_16x32> && std::is_same_v<shape2, typename ducks::rt_shape::rt_16x16>) {
                 #pragma unroll
-                for (int j = 0; j < dst.width; j++) {
-
-                    // now we are at the granularity of a single 16x32 tile in dst.
-                    // V_PERMLANE16_SWAP_B32:
-                    // Swap data between two vector registers. Odd rows of the first operand are swapped with even rows of the
-                    // second operand (one row is 16 lanes).
+                for (int i = 0; i < dst.height; i++) {
                     #pragma unroll
-                    for (int k = 0; k < 2; k++) {
-                        uint2_t res = __builtin_amdgcn_permlane16_swap(*reinterpret_cast<const uint32_t *>(&src.tiles[i][j * 2].data[k]), *reinterpret_cast<const uint32_t *>(&src.tiles[i][j * 2 + 1].data[k]), false, true);
-                        *reinterpret_cast<uint32_t *>(&dst.tiles[i][j].data[k]) = res.x;
-                        *reinterpret_cast<uint32_t *>(&dst.tiles[i][j].data[k + 2]) = res.y;
+                    for (int j = 0; j < dst.width; j++) {
+
+                        // now we are at the granularity of a single 16x32 tile in dst.
+                        // V_PERMLANE16_SWAP_B32:
+                        // Swap data between two vector registers. Odd rows of the first operand are swapped with even rows of the
+                        // second operand (one row is 16 lanes).
+                        #pragma unroll
+                        for (int k = 0; k < 2; k++) {
+                            uint2_t res = __builtin_amdgcn_permlane16_swap(*reinterpret_cast<const uint32_t *>(&src.tiles[i][j * 2].data[k]), *reinterpret_cast<const uint32_t *>(&src.tiles[i][j * 2 + 1].data[k]), false, true);
+                            *reinterpret_cast<uint32_t *>(&dst.tiles[i][j].data[k]) = res.x;
+                            *reinterpret_cast<uint32_t *>(&dst.tiles[i][j].data[k + 2]) = res.y;
+                        }
                     }
                 }
+            } else if constexpr (std::is_same_v<shape1, typename ducks::rt_shape::rt_16x32_4> && std::is_same_v<shape2, typename ducks::rt_shape::rt_32x32>) {
+                #pragma unroll
+                for (int i = 0; i < dst.height; i++) {
+                    #pragma unroll
+                    for (int j = 0; j < dst.width; j++) {
+                        #pragma unroll
+                        for (int k = 0; k < dst.packed_per_base_tile; k++) {
+                            dst.tiles[i][j].data[k] = src.tiles[i / 2][j].data[(i % 2) * dst.packed_per_base_tile + k];
+                        }
+                    }
+                }
+            } else {
+                static_assert(false, "Unsupported shape swap");
             }
         } else {
             static_assert(false, "Unsupported layout swap");
         }
     } else {
-        static_assert(false, "Unsupported matrix layout swap");
+        static_assert(false, "Unsupported dtype");
     }
-}
-
-/**
- * @brief Swaps the layout of a register base tile in place.
- *
- * This function swaps the layout of a register base tile in place by casting it to the
- * transposed layout type and then performing the layout swap.
- *
- * @tparam T2 The data type of the register tile elements.
- * @tparam layout The current layout of the register tile.
- * @param src[in] Reference to the register base tile to be swapped in place.
- * @return A reference to the swapped register base tile.
- */
-template<typename T, ducks::rt_layout::all layout1, ducks::rt_shape::all shape1, ducks::rt_layout::all layout2, ducks::rt_shape::all shape2>
-__device__ inline rt_base<T, layout1, shape1>& swap_layout_inplace(const rt_base<T, layout2, shape2> &src) {
-    rt_base<T, layout1, shape1> &dst = *(rt_base<T, layout1, shape1>*)(&src);
-    swap_layout(dst, src);
-    return dst;
 }
 
 /**
@@ -271,173 +89,26 @@ __device__ inline rt_base<T, layout1, shape1>& swap_layout_inplace(const rt_base
  */
 template<ducks::rt_layout::all layout1, ducks::rt_shape::all shape1, typename T, int _rows, int _cols, ducks::rt_layout::all layout2, ducks::rt_shape::all shape2>
 __device__ static inline rt<T, _rows, _cols, layout1, shape1>& swap_layout_inplace(rt<T, _rows, _cols, layout2, shape2> &tile) {
-    if constexpr (std::is_same_v<shape1, typename ducks::rt_shape::rt_16x32> && std::is_same_v<shape2, typename ducks::rt_shape::rt_16x16>) {
-
+    rt<T, _rows, _cols, layout1, shape1> &dst = *(rt<T, _rows, _cols, layout1, shape1>*)(&tile);
+    if constexpr (std::is_same_v<T, bf16>) {
         if constexpr (std::is_same_v<layout1, typename ducks::rt_layout::col> && std::is_same_v<layout2, typename ducks::rt_layout::col>) {
-            // src consists of 16x16 tiles while dst consists of 16x32 tiles.
-            // the reduction dimension (rows) stays the same, while the column dimension (cols) is doubled.
-            // For every two 16x16 tiles in src along the (width) axis, we fill one 16x32 tile in dst along the (width) axis.
-            // To do this for bf16, we issue 4 v_permlane16_swap instructions.
-            static_assert(std::is_same_v<T, bf16>, "only supports bf16");
-
-            #pragma unroll
-            for (int i = 0; i < tile.height; i++) {
-                #pragma unroll
-                for (int j = 0; j < tile.width; j++) {
-
-                    // now we are at the granularity of a single 16x32 tile in dst.
-                    // V_PERMLANE16_SWAP_B32:
-                    // Swap data between two vector registers. Odd rows of the first operand are swapped with even rows of the
-                    // second operand (one row is 16 lanes).
-                    #pragma unroll
-                    for (int k = 0; k < 2; k++) {
-                        uint2_t res = __builtin_amdgcn_permlane16_swap(*reinterpret_cast<const uint32_t *>(&tile.tiles[i][j * 2].data[k]), *reinterpret_cast<const uint32_t *>(&tile.tiles[i][j * 2 + 1].data[k]), false, true);
-                        *reinterpret_cast<uint32_t *>(&tile.tiles[i][j * 2].data[k]) = res.x;
-                        *reinterpret_cast<uint32_t *>(&tile.tiles[i][j * 2 + 1].data[k]) = res.y;
-                    }
-                }
+            if constexpr (std::is_same_v<shape1, typename ducks::rt_shape::rt_16x32> && std::is_same_v<shape2, typename ducks::rt_shape::rt_16x16>) {
+                swap_layout(dst, tile);
+            } else {
+                static_assert(false, "Unsupported shape swap");
             }
         } else {
             static_assert(false, "Unsupported layout swap");
         }
     } else {
-        static_assert(false, "Unsupported matrix layout swap");
+        static_assert(false, "Unsupported dtype");
     }
-    return *(rt<T, _rows, _cols, layout1, shape1>*)(&tile);
+    return dst;   
 }
 
 /* ----------  TRANSPOSE  ---------- */
-
-/**
- * @brief Transposes a register base tile.
- *
- * @tparam T2 The data type of the register tile elements.
- * @tparam layout The current layout of the register tile.
- * @param dst[out] Reference to the register tile in which to store the transposed src.
- * @param src[in] Reference to the register base tile to be transposed.
- */
-template<typename T, ducks::rt_layout::all layout, ducks::rt_shape::all shape>
-__device__ inline void transpose(rt_base<T, layout, shape> &dst, const rt_base<T, layout, shape> &src) {
-    int lane = laneid();
-    
-    if constexpr (std::is_same_v<layout, ducks::rt_layout::col> || std::is_same_v<layout, ducks::rt_layout::row>) {
-        int to_flip = ((lane % 32) / 16) * 8;
-        int or_not_to_flip = ((lane % 32) / 16) * 16;
-        int block_src_trans = 32*((lane%16)/8) + 8*(lane/32); 
-        int block_offset = lane%8; 
-
-        T src_tmp[16] = {
-            src.data[0].x, src.data[0].y,
-            src.data[1].x, src.data[1].y,
-            src.data[2].x, src.data[2].y,
-            src.data[3].x, src.data[3].y,
-            src.data[4].x, src.data[4].y,
-            src.data[5].x, src.data[5].y,
-            src.data[6].x, src.data[6].y,
-            src.data[7].x, src.data[7].y,
-        };
-
-        T dst_tmp[16];
-        #pragma unroll
-        for(int k = 0; k < 16; k++) {
-            int that_is_the_question = (k / 8) * 24;
-            if constexpr (std::is_same_v<T, bf16>) {
-                dst_tmp[block_offset^k^to_flip] = __float2bfloat16(__shfl(__bfloat162float(src_tmp[block_offset^k^to_flip]), (block_src_trans + block_offset^k^or_not_to_flip^that_is_the_question)));
-                // printf("Thread: %d, Setting: %d, Sending: %d, From: %d\n", lane, block_offset^k^to_flip, block_offset^k^to_flip, block_src_trans + block_offset^k^or_not_to_flip^that_is_the_question);
-            }
-            else {
-                dst_tmp[block_offset^k^to_flip] = __shfl(src_tmp[block_offset^k^to_flip], block_src_trans + block_offset^k^or_not_to_flip^that_is_the_question);
-            }
-        }
-
-        dst.data[0].x = dst_tmp[0];
-        dst.data[0].y = dst_tmp[1];
-        dst.data[1].x = dst_tmp[2];
-        dst.data[1].y = dst_tmp[3];
-        dst.data[2].x = dst_tmp[4];
-        dst.data[2].y = dst_tmp[5];
-        dst.data[3].x = dst_tmp[6];
-        dst.data[3].y = dst_tmp[7];
-        dst.data[4].x = dst_tmp[8];
-        dst.data[4].y = dst_tmp[9];
-        dst.data[5].x = dst_tmp[10];
-        dst.data[5].y = dst_tmp[11];
-        dst.data[6].x = dst_tmp[12];
-        dst.data[6].y = dst_tmp[13];
-        dst.data[7].x = dst_tmp[14];
-        dst.data[7].y = dst_tmp[15];
-    }
-    else {
-        static_assert(false, "Unsupported layout transpose");
-    }
-}
-
-/**
- * @brief Transposes a register tile.
- * 
- * This function is marked "sep", which means that the registers underlying dst MUST be separate
- * from the registers underlying src.
- *
- * @tparam T2 The data type of the register tile elements.
- * @tparam _height The height of the src register tile, and the width of the dst tile.
- * @tparam _width The width of the src register tile, and the height of the dst tile.
- * @tparam layout The layout of the register tile.
- * @param dst[out] Reference to the register tile in which to store the transposed src.
- * @param src[in] Reference to the register tile to be transposed.
- */
-template<ducks::rt::all RT>
-__device__ static inline void transpose_sep(RT &dst, const rt<typename RT::T, RT::cols, RT::rows, typename RT::layout> &src) {
-    #pragma unroll
-    for(int i = 0; i < RT::height; i++) {
-        #pragma unroll
-        for(int j = 0; j < RT::width; j++) {
-            transpose(dst.tiles[i][j], src.tiles[j][i]);
-        }
-    }
-}
-
-/**
- * @brief Transposes a register base tile in-place.
- *
- * @tparam T2 The data type of the register base tile elements.
- * @tparam layout The current layout of the register base tile.
- * @param src[in] Reference to the register tile to be transposed.
- * @return A reference to the transposed register base tile.
- */
-template<typename T2, ducks::rt_layout::all layout, ducks::rt_shape::all shape>
-__device__ inline rt_base<T2, layout, shape>& transpose_inplace(rt_base<T2, layout, shape> &src) {
-    transpose(src, src);
-    return src;
-}
-/**
- * @brief Transposes a square register tile in-place.
- *
- * @tparam T2 The data type of the register tile elements.
- * @tparam _height The height (in units of 16) of the src register tile, and the width of the dst tile. (Must be the same as _width.)
- * @tparam _width The width (in units of 16) of the src register tile, and the height of the dst tile. (Must be the same as _height.)
- * @tparam layout The current layout of the register tile.
- * @param src[in] Reference to the register tile to be transposed.
- * @return A reference to the transposed register tile.
- */
 template<typename T2, int _rows, int _cols, ducks::rt_layout::all layout, ducks::rt_shape::all shape>
-__device__ static inline rt<T2, _rows, _cols, layout, shape>& transpose_inplace(rt<T2, _rows, _cols, layout, shape> &tile) {
-    static_assert(_cols == _rows, "in-place register tile transpose is only allowed for square tiles.");
-    #pragma unroll
-    for(int i = 0; i < tile.height; i++) {
-        #pragma unroll
-        for(int j = 0; j < i; j++) {
-            rt_base<T2, layout, shape> tmp;
-            copy(tmp, tile.tiles[i][j]);
-            transpose(tile.tiles[i][j], tile.tiles[j][i]);
-            transpose(tile.tiles[j][i], tmp);
-        }
-        transpose_inplace(tile.tiles[i][i]);
-    }
-    return tile;
-}
-
-template<typename T2, int _rows, int _cols, ducks::rt_layout::all layout, ducks::rt_shape::all shape>
-__device__ static inline void swap_layout_and_transpose(rt<T2, _cols, _rows, typename ducks::rt_layout::transpose<layout>::type, typename ducks::rt_shape::transpose<shape>::type> &result, const rt<T2, _rows, _cols, layout, shape> &tile) {
+__device__ static inline void transpose(rt<T2, _cols, _rows, typename ducks::rt_layout::transpose<layout>::type, typename ducks::rt_shape::transpose<shape>::type> &result, const rt<T2, _rows, _cols, layout, shape> &tile) {
     #pragma unroll
     for (int i = 0; i < tile.height; i++) {
         #pragma unroll

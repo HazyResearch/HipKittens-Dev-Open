@@ -193,9 +193,25 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
     else static_assert(false, "Unknown shape");
     return label;
 }
-template<int H, int W, int NW, integral_wrapper _J, integral_wrapper _K> std::string generate_test_name(std::string test_id) {
-    constexpr int J = _J::value, K = _K::value;
-    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"_"+std::to_string(J)+"x"+std::to_string(K)+"]";
+template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_shape::all RT_SHAPE2, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
+    std::string label = generate_test_name<RT_SHAPE,ST_SHAPE,H,W,NW,L1>(test_id);
+    if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    else label += "_[rt_col_layout]";
+
+    // shapes
+    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE2>) label += "_[rt_16x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE2>) label += "_[rt_32x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE2>) label += "_[rt_32x32_8]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE2>) label += "_[rt_16x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE2>) label += "_[rt_32x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE2>) label += "_[rt_32x16_4]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE2>) label += "_[rt_16x32_4]";
+    else static_assert(false, "Unknown shape");
+    return label;
+}
+template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, integral_wrapper _ST_H> std::string generate_test_name(std::string test_id) {
+    constexpr int ST_H = _ST_H::value;
+    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"_"+std::to_string(ST_H)+"x"+std::to_string(W)+"]";
     if constexpr (NW > 1) {
         label += "_["+std::to_string(NW)+"warps]";
     }
@@ -324,8 +340,8 @@ struct wrapper_2d {
     using dtype = gmem_dtype<test>; // defaults to bf16 in global memory if the test doesn't specify.
     static void run(test_data& results) {
         test_info this_result;
-        this_result.label = generate_test_name<RT_SHAPE,ST_SHAPE,H,W,NUM_WORKERS,args...>(test::test_identifier);
-        if constexpr (test::template valid<RT_SHAPE,ST_SHAPE,H, W, NUM_WORKERS, args...>::value) {
+        this_result.label = generate_test_name<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>(test::test_identifier);
+        if constexpr (test::template valid<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>::value) {
             constexpr int SIZE = H*W*RT_SHAPE::cols*RT_SHAPE::rows;
             // initialize
             dtype *d_i, *d_o;
