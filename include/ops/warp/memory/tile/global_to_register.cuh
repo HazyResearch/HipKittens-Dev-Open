@@ -51,6 +51,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
                 const int col = dst.base_tile_cols*j + col_offset + k*dst.base_tile_elements_per_stride_group;
 
                 U2* tmp;
+                // TODO: fp8e4m3
                 if constexpr (std::is_same_v<U2, bf16_2>) {
 
                     // Use buffer_load_b64 for stride == 4, dtype == bf16
@@ -133,6 +134,9 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using T2 = base_types::packing<typename RT::dtype>::packed_type;
     using U = typename GL::dtype;
+
+    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
+
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
     
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
@@ -179,6 +183,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
 template<int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
     using T2 = RT::dtype;
+    using T = base_types::packing<T2>::unpacked_type;
     using U = typename GL::dtype;
     using U2 = base_types::packing<U>::packed_type;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
@@ -294,6 +299,8 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using U = typename GL::dtype;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
+
+    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
 
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();

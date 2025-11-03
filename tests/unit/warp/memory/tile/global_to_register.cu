@@ -9,6 +9,7 @@ static __global__ void g2r_global_wrapper_2d(const GL &input, const GL &output) 
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS, typename... args>
 struct g2r_wrapper_2d {
     using dtype = gmem_dtype<test>; // defaults to bf16 in global memory if the test doesn't specify.
+    using rt_dtype = test::rt_dtype;
     static void run(test_data& results) {
         test_info this_result;
         this_result.label = generate_test_name<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>(test::test_identifier);
@@ -46,13 +47,13 @@ template<typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_H=8, int M
 using g2r_sweep_size_2d = loop_h<g2r_wrapper_2d, test, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, MAX_H, args...>;
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_H=8, int MAX_W=8, typename... args> using g2r_sweep_size_2d_warp = g2r_sweep_size_2d<test, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, 1, args...>;
 
-template<typename T>
+template<typename T, typename RT = kittens::bf16>
 struct load_store {
     using dtype = T;
     template<typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<NW == 1 && W*H<=64>; // this is warp-level
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "reg_loadstore_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "reg_loadstore_gmem=half" :
-                                                    //   std::is_same_v<T, kittens::fp8e4m3> ? "reg_loadstore_gmem=fp8e4m3" :
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "reg_loadstore_gmem=fp8e4m3" :
                                                                                          "reg_loadstore_gmem=float";
     template<typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NW, kittens::ducks::gl::all GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         o_ref = i_ref; // overwrite the whole thing
@@ -75,7 +76,7 @@ void warp::memory::tile::global_to_register::tests(test_data &results) {
                          INTENSITY_4 ? 16 : -1;
                          
     using DEFAULT_ST_SHAPE = kittens::ducks::st_shape::st_16x16;
-
+    // TODO: fp8e4m3
     using RT_SHAPE_1 = kittens::ducks::rt_shape::rt_16x32;
     g2r_sweep_size_2d_warp<load_store<float>, RT_SHAPE_1, DEFAULT_ST_SHAPE, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     g2r_sweep_size_2d_warp<load_store<float>, RT_SHAPE_1, DEFAULT_ST_SHAPE, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);

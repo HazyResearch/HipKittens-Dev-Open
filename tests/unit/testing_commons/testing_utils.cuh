@@ -94,15 +94,15 @@ enum initializers {
     ARANGE = 1, // write an increasing sequence into i_ref and d_i arrays. useful for debugging memory movement.
     NONE   = 2  // use whatever values were already in i_ref. useful for detailed debugging.
 };
-template<typename T, initializers initializer=initializers::RANDOM, int SEED=42>
-void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> &o_ref) {
+template<typename T1, typename T2, initializers initializer=initializers::RANDOM, int SEED=42>
+void initialize(T1 **d_i, T2 **d_o, std::vector<float> &i_ref, std::vector<float> &o_ref) {
     using namespace kittens;
 
     const int input_size  = i_ref.size();
     const int output_size = o_ref.size();
 
     // Initialize matrices
-    std::vector<T> i_t(input_size);
+    std::vector<T1> i_t(input_size);
 
     std::mt19937 gen(SEED); // Standard mersenne_twister_engine
     std::uniform_real_distribution<float> dis(-1.0, 1.0);
@@ -117,30 +117,39 @@ void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> 
         else {
             f = i_ref[idx];
         }
-        if constexpr (std::is_same_v<T, bf16>) {
+        if constexpr (std::is_same_v<T1, bf16>) {
             i_t[idx] = __float2bfloat16(f); // fill in for transfer to device
             i_ref[idx] = __bfloat162float(i_t[idx]); // ensure lossiness of fp16 is captured on cpu
         }
-        else if constexpr (std::is_same_v<T, float>) {
+        else if constexpr (std::is_same_v<T1, float>) {
             i_t[idx] = f;
             i_ref[idx] = f;
         }
-        else if constexpr (std::is_same_v<T, half>) {
+        else if constexpr (std::is_same_v<T1, half>) {
             i_t[idx] = __float2half(f);
             i_ref[idx] = __half2float(i_t[idx]);
+        }
+        else if constexpr (std::is_same_v<T1, fp8e4m3>) {
+            i_t[idx] = fp8e4m3(f);
+            i_ref[idx] = float(i_t[idx]);
         }
         else {
             assert(false && "Unsupported data type");
         }
     }
 
-    hipMalloc(d_i, input_size  * sizeof(T));
-    hipMalloc(d_o, output_size * sizeof(T));
+    hipMalloc(d_i, input_size  * sizeof(T1));
+    hipMalloc(d_o, output_size * sizeof(T2));
     HipCheckError();
 
-    hipMemcpy(*d_i, i_t.data(), input_size * sizeof(T), hipMemcpyHostToDevice);
+    hipMemcpy(*d_i, i_t.data(), input_size * sizeof(T1), hipMemcpyHostToDevice);
     HipCheckError();
 }
+template<typename T, initializers initializer=initializers::RANDOM, int SEED=42>
+void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> &o_ref) {
+    initialize<T, T, initializer, SEED>(d_i, d_o, i_ref, o_ref);
+}
+
 extern int should_write_outputs;
 template<typename T>
 test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vector<float> &o_ref, std::string test_name, int cols, float atol=1e-2, float rtol=1e-2) { // default eps has to be fairly high due to lots of different types
@@ -148,42 +157,69 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
     const int input_size  = i_ref.size();
     const int output_size = o_ref.size();
     // copy back
-    T* o_t = new T[output_size];
+    T2* o_t = new T2[output_size];
     float *o = new float[output_size];
     hipDeviceSynchronize();
     HipCheckError();
-    hipMemcpy(o_t, d_o, output_size * sizeof(T), hipMemcpyDeviceToHost);
+    hipMemcpy(o_t, d_o, output_size * sizeof(T2), hipMemcpyDeviceToHost);
     HipCheckError();
     for(int idx = 0; idx < output_size; idx++) {
-        if constexpr (std::is_same_v<T, bf16>) {
+        if constexpr (std::is_same_v<T2, bf16>) {
             o[idx] = __bfloat162float(o_t[idx]);
             o_ref[idx] = __bfloat162float(__float2bfloat16(o_ref[idx]));
         }
-        else if constexpr (std::is_same_v<T, half>) {
+        else if constexpr (std::is_same_v<T2, half>) {
             o[idx] = __half2float(o_t[idx]);
             o_ref[idx] = __half2float(__float2half(o_ref[idx]));
         }
-        else if constexpr(std::is_same_v<T, float>) {
+        else if constexpr(std::is_same_v<T2, float>) {
             o[idx] = o_t[idx];
             o_ref[idx] = o_ref[idx];
+        }
+        else if constexpr (std::is_same_v<T2, fp8e4m3>) {
+            o[idx] = float(o_t[idx]);
+            o_ref[idx] = float(fp8e4m3(o_ref[idx]));
         }
         else {
             assert(false && "Unsupported data type");
         }
     }
     // check
-    std::cout << "test `" << test_name << "`";
+    std::cout << "test `" << test_name << "` ";
     bool good = true;
+    float max_diff = 0;
+    int max_diff_idx = -1;
+    int first_mismatch_idx = -1;
+    float first_ref_val = 0, first_out_val = 0;
+    float max_ref_val = 0, max_out_val = 0;
     for(int i = 0; i < output_size; i++) {
         if(abs(o_ref[i] - o[i]) > atol + rtol*abs(o_ref[i])) {
             printf("o_ref[%d]: %f, o[%d]: %f\n", i, o_ref[i], i, o[i]);
             printf("abs(o_ref[%d] - o[%d]): %f\n", i, i, abs(o_ref[i] - o[i]));
             good = false;
-            break;
+            if(first_mismatch_idx == -1) {
+                first_mismatch_idx = i;
+                first_ref_val = o_ref[i];
+                first_out_val = o[i];
+            }
+            if(diff > max_diff) {
+                max_diff = diff;
+                max_diff_idx = i;
+                max_ref_val = o_ref[i];
+                max_out_val = o[i];
+            }
         }
     }
     if(good) std::cout << " -- PASSED" << std::endl;
-    else std::cout << " ----- ALERT! FAILED test `" << test_name << "` -----" << std::endl;
+    else {
+        std::cout << " ----- ALERT! FAILED test `" << test_name << "` -----" << std::endl;
+        if(first_mismatch_idx != -1) {
+            std::cout << "First mismatch at index " << first_mismatch_idx << ": ref=" << first_ref_val << ", out=" << first_out_val << std::endl;
+        }
+        if(max_diff_idx != -1) {
+            std::cout << "Largest mismatch at index " << max_diff_idx << ": ref=" << max_ref_val << ", out=" << max_out_val << ", diff=" << max_diff << std::endl;
+        }
+    }
     if(should_write_outputs && !good) {
         std::ofstream reffile("outputs/"+test_name+"_ref.txt");
         std::ofstream outfile("outputs/"+test_name+"_out.txt");
@@ -204,6 +240,9 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
             if(i%cols == cols-1) {
                 reffile << '\n';
             }
+            if (i == input_size/2-1) {
+                reffile << '\n';
+            }
         }
         reffile.close();
         outfile.close();
@@ -214,4 +253,9 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
     delete[] o_t, o;
     HipCheckError();
     return good ? test_result::PASSED : test_result::FAILED;
+}
+
+template<typename T>
+test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vector<float> &o_ref, std::string test_name, int cols, float eps=5e-2) {
+    return validate<T, T>(d_i, d_o, i_ref, o_ref, test_name, cols, eps);
 }

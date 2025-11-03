@@ -338,6 +338,7 @@ static __global__ void global_wrapper_2d(const G input, const G output) {
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS=1, typename... args>
 struct wrapper_2d {
     using dtype = gmem_dtype<test>; // defaults to bf16 in global memory if the test doesn't specify.
+    using rt_dtype = test::rt_dtype;
     static void run(test_data& results) {
         test_info this_result;
         this_result.label = generate_test_name<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>(test::test_identifier);
@@ -361,8 +362,10 @@ struct wrapper_2d {
             global_wrapper_2d<test, RT_SHAPE, ST_SHAPE, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY / 2>>>(input, output);
             // fill in correct results on cpu
             test::template host_func<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, GL, args...>(i_ref, o_ref);
-            // check and cleanup
 
+            hipDeviceSynchronize();
+
+            // check and cleanup
             int is_fp8 = (this_result.label.find("fp8") != std::string::npos) || (this_result.label.find("e4m3") != std::string::npos) || (this_result.label.find("e5m2") != std::string::npos);
             this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*RT_SHAPE::cols, is_fp8 ? 0.1 : 1e-2); // mma's sometimes produce small errors. this appears to be hardware.
         }
@@ -383,6 +386,7 @@ struct sweep_gmem_type_2d {
         sweep_size_2d<test<float>, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         sweep_size_2d<test<kittens::bf16>, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         sweep_size_2d<test<kittens::half>, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        // TODO: fp8e4m3 sweep_size_2d<test<kittens::fp8e4m3>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
     }
 };
 template<template<typename> typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename... args> using sweep_gmem_type_2d_warp = sweep_gmem_type_2d<test, RT_SHAPE, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, args...>;

@@ -30,7 +30,7 @@ HIPFLAGS+= -DTEST_WARP_MEMORY_TILE_SHARED_TO_REGISTER
 ifeq ($(COMP_LEVEL),safe)
 HIPFLAGS+= -O0
 else ifeq ($(COMP_LEVEL),debug)
-HIPFLAGS+= -g -G
+HIPFLAGS+= -g
 else ifeq ($(COMP_LEVEL),profile)
 HIPFLAGS+= -O3 -save-temps=obj
 endif

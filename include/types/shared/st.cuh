@@ -80,8 +80,8 @@ struct KITTENS_DEFAULT_ALIGN st {
 
     dtype data[rows*cols]; ///< Raw data storage for the tile.
 
-    __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {
-        return shape::template swizzle<T>(coord);
+    __device__ __forceinline__ static const uint32_t swizzle(int2 coord, uint32_t base_addr = 0) {
+        return shape::template swizzle<T>(coord, base_addr);
     }
 
     // vector types
@@ -149,8 +149,8 @@ struct st_subtile {
         data = &src.data[subtile_offset];
     }
 
-    __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {
-        return ST::swizzle(coord);
+    __device__ __forceinline__ static const uint32_t swizzle(int2 coord, uint32_t base_addr = 0) {
+        return ST::swizzle(coord, base_addr);
     }
 
     // vector types
@@ -183,4 +183,5 @@ template<typename T> concept all = requires {
 template<int _height, int _width, ducks::st_shape::all _shape> using st_bf = st<bf16,  _height, _width, _shape>;
 template<int _height, int _width, ducks::st_shape::all _shape> using st_hf = st<half,  _height, _width, _shape>;
 template<int _height, int _width, ducks::st_shape::all _shape> using st_fl = st<float, _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape> using st_fp8e4m3 = st<fp8e4m3, _height, _width, _shape>;
 }

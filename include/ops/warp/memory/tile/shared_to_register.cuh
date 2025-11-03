@@ -21,10 +21,12 @@ namespace kittens {
  *
  * @tparam RT The register tile type
  * @tparam ST The shared tile type
+ * @tparam swizzle_src_ptr Whether the swizzled offset includes the ST
+ *          base pointer. Optional register pressure optimization.
  * @param dst[out] The destination register tile.
  * @param src[in]  The source shared tile.
  */
-template<ducks::rt::row_layout RT, ducks::st::all ST>
+template<ducks::rt::row_layout RT, ducks::st::all ST, bool swizzle_src_ptr = false>
 __device__ inline static void load(RT &dst, const ST &src) {
 
     static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
@@ -35,6 +37,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
     using U  = ST::dtype;
     using U2 = base_types::packing<U >::packed_type;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
+
+    static_assert(std::is_same_v<T, U>, "register and shared tile must have the same dtype");
 
     const int laneid = kittens::laneid();
 
@@ -56,10 +60,15 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 for (int j = 0; j < register_subtiles_per_shared_subtile_row; j++) {
                     const int row = i * RT::base_tile_rows + row_offset;
                     const int col = j * RT::base_tile_cols + col_offset + k * RT::base_tile_elements_per_stride_group;
-                    const uint32_t swizzled_offset = src.swizzle({row, col});
-                    const uint32_t next_swizzled_offset = src.swizzle({row, col + 4});
-                    const uint32_t addr = src_ptr + swizzled_offset;
-                    const uint32_t next_addr = src_ptr + next_swizzled_offset;
+                    const uint32_t addr = [&] {
+                        if constexpr (swizzle_src_ptr) {
+                            const uint32_t swizzled_offset = src.swizzle({row, col}, src_ptr);
+                            return swizzled_offset;
+                        } else {
+                            const uint32_t swizzled_offset = src.swizzle({row, col});
+                            return src_ptr + swizzled_offset;
+                        }
+                    }();
 
                     const int idx = k * RT::base_tile_stride / packing;
 
@@ -86,6 +95,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     asm volatile(
                                         "ds_read_b64 %0, %1 offset:%2\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx]))
+                                        : "v"(addr), "i"(offset)
+                                        : "memory"
+                                    );
+                                } else {
+                                    static_assert(false, "Unsupported stride");
+                                }
+                            } else if constexpr (std::is_same_v<U2, fp8e4m3_4>) {
+                                if constexpr (RT::base_tile_stride == 16) {
+                                    asm volatile(
+                                        "ds_read_b128 %0, %1 offset:%2\n"
+                                        : "=v"(*reinterpret_cast<float4*>(&dst.tiles[register_row][register_col].data[idx]))
                                         : "v"(addr), "i"(offset)
                                         : "memory"
                                     );
@@ -161,6 +181,13 @@ __device__ inline static void load(RT &dst, const ST &src) {
                         } else {
                             static_assert(false, "Unsupported stride");
                         }
+                    } else if constexpr (std::is_same_v<U2, fp8e4m3_4> && RT::base_tile_stride == 16) {
+                        asm volatile(
+                            "ds_read_b128 %0, %1 offset:%2\n"
+                            : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[idx]))
+                            : "v"(addr), "i"(offset)
+                            : "memory"
+                        );
                     } else {
                         static_assert(false, "Unsupported type");
                     }

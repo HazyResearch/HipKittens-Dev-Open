@@ -9,6 +9,7 @@ static __global__ void g2s_global_wrapper_2d(const GL input, const GL output) {
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS, typename axis, typename... args>
 struct g2s_wrapper_2d {
     using dtype = gmem_dtype<test>; // defaults to bf16 in global memory if the test doesn't specify.
+    using rt_dtype = test::rt_dtype;
     static void run(test_data& results) {
         test_info this_result;
         this_result.label = generate_test_name<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>(test::test_identifier);
@@ -56,7 +57,7 @@ template<typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_H=8, int M
 // };
 
 
-template<typename T>
+template<typename T, typename RT = kittens::bf16>
 struct st_load_store {
     using dtype = T;
     template<typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NW, typename axis> using valid = std::bool_constant<
@@ -64,7 +65,8 @@ struct st_load_store {
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "shared_loadstore_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "shared_loadstore_gmem=half" :
-                                                                                         "shared_loadstore_gmem=float";
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "shared_loadstore_gmem=fp8e4m3" :
+                                                                                              "shared_loadstore_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL, typename axis> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         o_ref = i_ref; // overwrite the whole thing
     }
@@ -107,7 +109,7 @@ void warp::memory::tile::global_to_shared::tests(test_data &results) {
 
     using ST_SHAPE_2 = kittens::ducks::st_shape::st_16x16_swizzled;
     // NOTE: unsupported.
-
+    // TODO: fp8e4m3
     using RT_SHAPE_3 = kittens::ducks::rt_shape::rt_32x32;
     using ST_SHAPE_3 = kittens::ducks::st_shape::st_32x32;
     g2s_sweep_size_2d_warp<st_load_store<kittens::bf16>, RT_SHAPE_3, ST_SHAPE_3, SIZE, SIZE, I2_t>::run(results);
