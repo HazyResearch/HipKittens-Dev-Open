@@ -235,6 +235,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
+        int condition = (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0);
+
         // Cluster 1:
         //      Load K3 into shared 
         G::load<1, false>(k_smem[1], g.Kg, {batch_idx, j, head_idx_kv, 0}, swizzled_offsets_K, ks0, ks1, ks2, ks3, k_base);
@@ -253,8 +255,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
         //      Partial softmax for QK1
         col_max(max_vec, att_block[1], max_vec_prev);
         float max_scale_diff = get_max_diff(max_vec_prev, max_vec);
-        float scale_factor = (max_scale_diff * TEMPERATURE_SCALE >= -RESCALE_THRESHOLD) ? 1.0f : 0.0f;
-        if (scale_factor == 1.0f) {
+        float delta = -max_scale_diff;
+        if (delta < RESCALE_THRESHOLD) {
             copy(max_vec, max_vec_prev); 
         } else {
             sub(scale_vec, max_vec_prev, max_vec);
@@ -264,10 +266,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
         }
         sub_col(att_block[1], att_block[1], max_vec);
         exp2(att_block[1].tiles[0][0], att_block[1].tiles[0][0]);
-        sched_barrier_pairs<10, 5, 2>();
+        // sched_barrier_pairs<10, 5, 2>();
         sched_barrier_exp_pairs<6, 3, 2>();
-        __builtin_amdgcn_sched_barrier(0);
-        // mul_col(o_reg, o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -319,8 +319,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
         //      Partial softmax for QK2
         col_max(max_vec, att_block[0], max_vec_prev);
         max_scale_diff = get_max_diff(max_vec_prev, max_vec);
-        scale_factor = (max_scale_diff * TEMPERATURE_SCALE >= -RESCALE_THRESHOLD) ? 1.0f : 0.0f;
-        if (scale_factor == 1.0f) {
+        delta = -max_scale_diff;
+        if (delta < RESCALE_THRESHOLD) {
             copy(max_vec, max_vec_prev);  // Revert to old max
         } else {
             sub(scale_vec, max_vec_prev, max_vec);
@@ -332,8 +332,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         exp2(att_block[0].tiles[0][0], att_block[0].tiles[0][0]);
         sched_barrier_pairs<10, 5, 4>();
         sched_barrier_exp_pairs<6, 3, 4>();
-        __builtin_amdgcn_sched_barrier(0);
-        // mul_col(o_reg, o_reg, scale_vec);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
