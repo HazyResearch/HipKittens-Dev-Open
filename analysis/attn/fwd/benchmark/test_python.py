@@ -10,6 +10,7 @@ import aiter
 
 torch.manual_seed(0)
 random.seed(0)
+torch.cuda.set_device(7)
 
 torch.set_printoptions(
     precision=3,        # decimals
