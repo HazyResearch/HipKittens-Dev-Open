@@ -477,9 +477,9 @@
                  ([&]<std::size_t M>() {
                      perform_store_at.template operator()<N, M>();
                  }.template operator()<Ms>(), ...);
-             }(std::make_index_sequence<ST::width>{});
+             }(std::make_index_sequence<ST::subtiles_per_row>{});
          }.template operator()<Ns>(), ...);
-     }(std::make_index_sequence<ST::height>{});
+     }(std::make_index_sequence<ST::subtiles_per_col>{});
  }
  
  }
