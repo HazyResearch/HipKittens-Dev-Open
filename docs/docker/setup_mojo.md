@@ -39,9 +39,17 @@ pixi add modular
 pixi shell
 ```
 
+### Install
+
+```bash
+git clone https://github.com/modular/modular.git
+cd max/kernels/benchmarks/gpu/
+```
+
 Run: 
 ```
-mojo kernel.mojo
+mojo bench_mha.mojo
+mojo bench_matmul.mojo
 ```
 
 
