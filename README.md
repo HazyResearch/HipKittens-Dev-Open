@@ -145,4 +145,12 @@ We provide resources for profiling kernels, dockers, and HipKittens in [HipKitte
 Contact: William Hu [willhu@stanford.edu](willhu@stanford.edu) and Simran Arora [simran@cs.stanford.edu](simran@cs.stanford.edu).
 Join us on Discord to get involved, [invitation link](https://discord.com/channels/1189498204333543425/1300872762163728550)! We welcome community contributions.
 
-
+If you use or build on this work, please consider citing:
+```
+@article{chen2021pixelated,
+  title={Pixelated Butterfly: Simple and Efficient Sparse training for Neural Network Models},
+  author={Chen, Beidi and Dao, Tri and Liang, Kaizhao and Yang, Jiaming and Song, Zhao and Rudra, Atri and R{\'e}, Christopher},
+  booktitle={International Conference on Learning Representations}
+  year={2021}
+}
+```
