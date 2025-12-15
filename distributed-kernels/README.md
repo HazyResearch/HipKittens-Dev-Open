@@ -4,7 +4,7 @@
 ## Start docker
 
 ```bash
- docker run -it \
+podman run -it \
     --ipc=host \
     --network=host \
     --privileged \
@@ -30,8 +30,13 @@ apt-get install -y libopenmpi-dev openmpi-bin
 ## Build and Run
 
 ```terminal
-cd kernels/dist-gemm/bf16fp32/mi350x/micros/producer_consumer/16x32/
-cmake -B build
-cmake --build build --parallel 16 
+cd distributed-kernels/
+
+# Configures the build to fetch Iris, select the ROCm/HIP toolchain and GPU architecture, and compile HIP + ThunderKittens code into Python extension modules via pybind11.
+cmake -B build -DDK_BUILD=bf16_gemm
+# Implements the actual GPU kernel(s) and pybind11 bindings for the tk_kernel Python module, targeting a specific CDNA architecture.
+cmake --build build -j 16
+
+# Runs the kernel
 python3 example.py
 ```

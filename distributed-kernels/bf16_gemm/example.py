@@ -1,4 +1,5 @@
 import torch
+import sys; sys.path.insert(0, "..")
 import iris_py
 import tk_kernel
 
