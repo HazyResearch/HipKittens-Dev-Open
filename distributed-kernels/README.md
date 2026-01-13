@@ -4,6 +4,10 @@
 ## Start docker
 
 ```bash
+salloc --reservation=-gpu-5_reservation --exclusive --mem=0
+```
+
+```bash
 podman run -it \
     --ipc=host \
     --network=host \
