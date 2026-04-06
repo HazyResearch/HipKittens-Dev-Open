@@ -130,17 +130,25 @@ void ag_gemm_tk(ag_globals g) {
         }
 
         // ── K-tile loop: load A once, compute against both B shards ──
+        //
+        // Buffer protocol (2 barriers per tile when has_r1, 1 when !has_r1):
+        //   Phase 1: Producers load B_r1[tile] -> Bs[toc].
+        //            Consumers compute C0 += As[tic] * Bs[tic] (A, B_r0 from prefetch).
+        //            Barrier.
+        //   Phase 2: Consumers compute C1 += As[tic] * Bs[toc] (A reused, B_r1 just loaded).
+        //            Producers load A[tile+1] -> As[toc], B_r0[tile+1] -> Bs[tic].
+        //            Safe: consumers read As[tic]/Bs[toc], producers write As[toc]/Bs[tic].
+        //            Barrier + tic/toc swap.
 
         int tic = 0, toc = 1;
 
-        // Prefetch first A tile
+        // Prefetch first A tile and B_r0 tile 0
         if (is_producer) {
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
                 G::load<2, false>(As[tic][m][0], g.a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
                 G::load<2, false>(As[tic][m][1], g.a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
             }
-            // Load B from rank r0
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
                 G::load<2, false>(Bs[tic][n][0], remote_b0, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
@@ -154,7 +162,7 @@ void ag_gemm_tk(ag_globals g) {
             // ── Phase 1: Compute C0 += A * B_r0^T while prefetching B_r1 ──
 
             if (is_producer && has_r1) {
-                // Load B from rank r1 into toc buffer
+                // Load B_r1[tile] -> Bs[toc]
                 #pragma unroll
                 for (int n = 0; n < N_BLOCK; n++) {
                     G::load<2, false>(Bs[toc][n][0], remote_b1, {0, 0, col*2 + 2*n + 0, tile}, swizzled_offsets_B);
@@ -162,7 +170,7 @@ void ag_gemm_tk(ag_globals g) {
                 }
                 __builtin_amdgcn_s_waitcnt(0);
             } else if (is_consumer) {
-                // Compute C0 += A_tic * B_r0_tic
+                // C0 += As[tic] * Bs[tic] (A and B_r0 from prefetch/previous phase 2)
                 A_slice a0;
                 B_slice b0, b1;
 
@@ -196,16 +204,18 @@ void ag_gemm_tk(ag_globals g) {
             if (!has_r1) continue;
 
             // ── Phase 2: Compute C1 += A * B_r1^T while prefetching next A + B_r0 ──
+            // Consumers read: As[tic], Bs[toc]  (A current tile, B_r1 just loaded)
+            // Producers write: As[toc], Bs[tic]  (next A and B_r0 — no conflicts!)
 
             if (is_producer) {
                 if (tile + 1 < num_tiles) {
-                    // Load next A tile
+                    // Load next A tile -> As[toc]  (consumers read As[tic], safe)
                     #pragma unroll
                     for (int m = 0; m < M_BLOCK; m++) {
-                        G::load<2, false>(As[tic][m][0], g.a, {0, 0, row*2 + 2*m + 0, tile + 1}, swizzled_offsets_A);
-                        G::load<2, false>(As[tic][m][1], g.a, {0, 0, row*2 + 2*m + 1, tile + 1}, swizzled_offsets_A);
+                        G::load<2, false>(As[toc][m][0], g.a, {0, 0, row*2 + 2*m + 0, tile + 1}, swizzled_offsets_A);
+                        G::load<2, false>(As[toc][m][1], g.a, {0, 0, row*2 + 2*m + 1, tile + 1}, swizzled_offsets_A);
                     }
-                    // Load B from rank r0 for next tile
+                    // Load B_r0[tile+1] -> Bs[tic]  (consumers read Bs[toc], safe)
                     #pragma unroll
                     for (int n = 0; n < N_BLOCK; n++) {
                         G::load<2, false>(Bs[tic][n][0], remote_b0, {0, 0, col*2 + 2*n + 0, tile + 1}, swizzled_offsets_B);
@@ -214,11 +224,10 @@ void ag_gemm_tk(ag_globals g) {
                 }
                 __builtin_amdgcn_s_waitcnt(0);
             } else if (is_consumer) {
-                // Compute C1 += A_toc * B_r1_toc (A is still in tic from phase 1, B_r1 is in toc)
+                // C1 += As[tic] * Bs[toc]  (A from current tile, B_r1 from Phase 1 load)
                 A_slice a0;
                 B_slice b0, b1;
 
-                // A is still valid in As[tic] from phase 1 load
                 auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[toc][local_warp_id][0], {0, 0});
                 load(b0, st_b);
                 auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
