@@ -21,10 +21,19 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// All-Gather GEMM globals
-// C[M, N] = A[M, K] @ B_full[N, K]^T
-// B is column-sharded: each rank owns B_shard[N_local, K], N_local = N / world_size
-// Each rank has full A, produces full C by iterating over remote B shards via IPC
+// Per-rank-iteration kernel args
+struct ag_kernel_args {
+    gl<bf16, -1, -1, -1, -1> a;        // [M, K] - local
+    gl<bf16, -1, -1, -1, -1> remote_b; // [N_local, K] - translated to point at source_rank's shard
+    gl<bf16, -1, -1, -1, -1> c;        // [M, N] - full output, local
+
+    int M;
+    int N_local;
+    int K;
+    int col_offset_tiles;  // offset into C's column dimension (in N_BLOCK units)
+};
+
+// Host-side globals for pybind11
 struct ag_globals {
     gl<bf16, -1, -1, -1, -1> a;       // [M, K] - local, same on all ranks
     gl<bf16, -1, -1, -1, -1> b_shard; // [N_local, K] - local shard of B
@@ -38,7 +47,6 @@ struct ag_globals {
     int world_size;
 
     hipStream_t stream;
-    // Grid tiles over (M, N_local) - one rank's B shard at a time
     dim3 grid()  { return dim3(ceil_div(N_local, NEW_COL_BLOCK_SIZE),
                               ceil_div(M, NEW_ROW_BLOCK_SIZE)); }
     dim3 block() { return dim3(NUM_THREADS); }
@@ -46,7 +54,7 @@ struct ag_globals {
 };
 
 __global__ __launch_bounds__(NUM_THREADS, 2)
-void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
+void ag_gemm_tk(ag_kernel_args args) {
 
     // shared memory
     extern __shared__ alignment_dummy __shm[];
@@ -58,23 +66,6 @@ void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
     ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
     rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
 
-    // Compute pointer translation for remote B access
-    int cur_rank = g.iris_ctx.cur_rank();
-    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
-    uintptr_t remote_base = g.iris_ctx.get_heap_base(source_rank);
-    intptr_t ptr_delta = (intptr_t)remote_base - (intptr_t)local_base;
-
-    // Construct translated gl for remote B shard
-    // The remote rank's b_shard has the same offset from its heap base as ours from ours
-    bf16* local_b_ptr = g.b_shard.raw_ptr;
-    bf16* remote_b_ptr = reinterpret_cast<bf16*>((uintptr_t)local_b_ptr + ptr_delta);
-    // Create a gl pointing to the remote B shard
-    gl<bf16, -1, -1, -1, -1> remote_b(remote_b_ptr, nullptr,
-        g.b_shard.template shape<0>(),  // batch  (from 4D layout)
-        g.b_shard.template shape<1>(),  // depth
-        g.b_shard.template shape<2>(),  // rows = N_local
-        g.b_shard.template shape<3>()); // cols = K
-
     // Original WGID
     int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
     const int NUM_WGS  = gridDim.x * gridDim.y;
@@ -82,15 +73,14 @@ void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
     // Swizzle chiplet so that wgids are in the same XCD
     wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
     // Swizzle for better L2 within the same XCD
-    const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
-    const int num_pid_n = ceil_div(g.N_local, NEW_COL_BLOCK_SIZE);
+    const int num_pid_m = ceil_div(args.M, NEW_ROW_BLOCK_SIZE);
+    const int num_pid_n = ceil_div(args.N_local, NEW_COL_BLOCK_SIZE);
     const int num_wgid_in_group = WGM * num_pid_n;
     int group_id = wgid / num_wgid_in_group;
     int first_pid_m = group_id * WGM;
     int group_size_m = min(num_pid_m - first_pid_m, WGM);
     int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
     int pid_n = (wgid % num_wgid_in_group) / group_size_m;
-    // Assign the tile's row/column based on pid_m and pid_n
     int row = pid_m * M_BLOCK;
     int col = pid_n * N_BLOCK;  // col within N_local
 
@@ -107,22 +97,21 @@ void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
     constexpr int memcpy_per_tile = BLOCK_SIZE * BLOCK_SIZE * sizeof(T) / bytes_per_memcpy;
     uint32_t swizzled_offsets_A[memcpy_per_tile];
     uint32_t swizzled_offsets_B[memcpy_per_tile];
-    G::prefill_swizzled_offsets(As[0][0][0], g.a, swizzled_offsets_A);
-    G::prefill_swizzled_offsets(Bs[0][0][0], remote_b, swizzled_offsets_B);
+    G::prefill_swizzled_offsets(As[0][0][0], args.a, swizzled_offsets_A);
+    G::prefill_swizzled_offsets(Bs[0][0][0], args.remote_b, swizzled_offsets_B);
 
     int tic = 0;
     int toc = 1;
-    // Producers load first K-tile of A (local) and B (remote via IPC)
     if (is_producer) {
         #pragma unroll
         for (int m = 0; m < M_BLOCK; m++) {
-            G::load<2, false>(As[tic][m][0], g.a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
-            G::load<2, false>(As[tic][m][1], g.a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[tic][m][0], args.a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[tic][m][1], args.a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
         }
         #pragma unroll
         for (int n = 0; n < N_BLOCK; n++) {
-            G::load<2, false>(Bs[tic][n][0], remote_b, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
-            G::load<2, false>(Bs[tic][n][1], remote_b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[tic][n][0], args.remote_b, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[tic][n][1], args.remote_b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
         }
         __builtin_amdgcn_s_waitcnt(0);
     }
@@ -134,20 +123,20 @@ void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
         zero(C_accum[1][0]);
         zero(C_accum[1][1]);
     }
-    int num_tiles = g.K / BLOCK_SIZE;
+    int num_tiles = args.K / BLOCK_SIZE;
     #pragma unroll
     for (int tile = 0; tile < num_tiles-1; ++tile, tic ^= 1, toc ^= 1) {
 
         if (is_producer) {
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
-                G::load<2, false>(As[toc][m][0], g.a, {0, 0, row*2 + 2*m + 0, tile + 1}, swizzled_offsets_A);
-                G::load<2, false>(As[toc][m][1], g.a, {0, 0, row*2 + 2*m + 1, tile + 1}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][0], args.a, {0, 0, row*2 + 2*m + 0, tile + 1}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][1], args.a, {0, 0, row*2 + 2*m + 1, tile + 1}, swizzled_offsets_A);
             }
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
-                G::load<2, false>(Bs[toc][n][0], remote_b, {0, 0, col*2 + 2*n + 0, tile + 1}, swizzled_offsets_B);
-                G::load<2, false>(Bs[toc][n][1], remote_b, {0, 0, col*2 + 2*n + 1, tile + 1}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][0], args.remote_b, {0, 0, col*2 + 2*n + 0, tile + 1}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][1], args.remote_b, {0, 0, col*2 + 2*n + 1, tile + 1}, swizzled_offsets_B);
             }
             __builtin_amdgcn_s_waitcnt(0);
         } else if (is_consumer) {
@@ -213,13 +202,12 @@ void ag_gemm_tk(ag_globals g, int source_rank, int col_offset_tiles) {
     }
 
     // Store to C — local write, no iris needed
-    // Column index into full C = col_offset_tiles + col (within N_local partition)
     if (is_consumer) {
-        int c_col = col_offset_tiles + col;
-        store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, c_col * 2 + local_warp_id * 2 + 0});
-        store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, c_col * 2 + local_warp_id * 2 + 1});
-        store(g.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, c_col * 2 + local_warp_id * 2 + 0});
-        store(g.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, c_col * 2 + local_warp_id * 2 + 1});
+        int c_col = args.col_offset_tiles + col;
+        store(args.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, c_col * 2 + local_warp_id * 2 + 0});
+        store(args.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, c_col * 2 + local_warp_id * 2 + 1});
+        store(args.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, c_col * 2 + local_warp_id * 2 + 0});
+        store(args.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, c_col * 2 + local_warp_id * 2 + 1});
     }
 }
 
@@ -228,29 +216,32 @@ void dispatch_ag_gemm(ag_globals g) {
     hipFuncSetAttribute((void*)ag_gemm_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
     int cur_rank = g.iris_ctx.cur_rank();
-    // N_local in tile units for column offset into C
-    // Each HALF_BLOCK_SIZE tile covers 32 rows of B (= 32 columns of C)
-    // N_BLOCK tiles per workgroup, each tile is HALF_BLOCK_SIZE
-    // col_offset_tiles = source_rank * (N_local / HALF_BLOCK_SIZE) / 2
-    // But the gl coord system uses HALF_BLOCK_SIZE as the tile unit
-    // In the existing kernel, col is in units of N_BLOCK (each N_BLOCK = 4 tiles of HALF_BLOCK_SIZE)
-    // The gl indexing {0,0,row,col} where col is in HALF_BLOCK_SIZE-tile units
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
 
     for (int source_rank = 0; source_rank < g.world_size; source_rank++) {
-        // Column offset in the same units as 'col' in the kernel (N_BLOCK-sized groups)
-        // N_local elements -> N_local / HALF_BLOCK_SIZE half-block tiles -> / 2 for the [2] sub-tiling
-        // But col is in N_BLOCK units, and the store uses col * 2 + local_warp_id * 2
-        // Actually col is NOT in N_BLOCK units. col = pid_n * N_BLOCK, and store does col*2 + ...
-        // The gl coord for columns: the 4th dim is in HALF_BLOCK_SIZE tile units
-        // source_rank * N_local elements -> source_rank * N_local / HALF_BLOCK_SIZE tiles
-        // In the store: c_col * 2 + local_warp_id * 2 + {0,1}
-        // c_col = col_offset_tiles + col, where col = pid_n * N_BLOCK
-        // So col_offset_tiles should be in the same units: N_BLOCK units
-        // source_rank * (N_local / NEW_COL_BLOCK_SIZE) * N_BLOCK
-        // = source_rank * ceil_div(N_local, NEW_COL_BLOCK_SIZE) * N_BLOCK
-        // Since N_local should be divisible: source_rank * (N_local / NEW_COL_BLOCK_SIZE) * N_BLOCK
+        // Translate local b_shard pointer to point at source_rank's b_shard
+        uintptr_t remote_base = g.iris_ctx.get_heap_base(source_rank);
+        intptr_t ptr_delta = (intptr_t)remote_base - (intptr_t)local_base;
+        bf16* remote_b_ptr = reinterpret_cast<bf16*>((uintptr_t)g.b_shard.raw_ptr + ptr_delta);
+
+        // Construct gl for remote B shard on host (same shape as local b_shard)
+        gl<bf16, -1, -1, -1, -1> remote_b(remote_b_ptr,
+            g.b_shard.batch(), g.b_shard.depth(),
+            g.b_shard.rows(), g.b_shard.cols());
+
+        // Column offset: source_rank * (N_local / BLOCK_SIZE) in N_BLOCK units
         int col_offset_tiles = source_rank * (g.N_local / NEW_COL_BLOCK_SIZE) * N_BLOCK;
-        ag_gemm_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g, source_rank, col_offset_tiles);
+
+        ag_kernel_args args;
+        args.a = g.a;
+        args.remote_b = remote_b;
+        args.c = g.c;
+        args.M = g.M;
+        args.N_local = g.N_local;
+        args.K = g.K;
+        args.col_offset_tiles = col_offset_tiles;
+
+        ag_gemm_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(args);
     }
 }
 
