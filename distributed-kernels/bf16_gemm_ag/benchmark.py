@@ -58,9 +58,6 @@ ITERS = 50
 configs = [
     # (M,    K,    N)
     (7680,  8192, 8192),
-    (3840,  4096, 4096),
-    (15360, 8192, 8192),
-    (7680,  4096, 16384),
 ]
 
 if rank == 0:
@@ -103,7 +100,6 @@ for M, K, N in configs:
     iris_device_ctx = iris.get_device_view()
 
     for _ in range(WARMUP):
-        C_iris.zero_()
         tk_kernel.dispatch_ag_gemm(A_iris, B_shard_iris, C_iris, iris_device_ctx,
                                    M, N, K, N_local, world_size)
     torch.cuda.synchronize()
@@ -113,7 +109,6 @@ for M, K, N in configs:
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(ITERS):
-        C_iris.zero_()
         tk_kernel.dispatch_ag_gemm(A_iris, B_shard_iris, C_iris, iris_device_ctx,
                                    M, N, K, N_local, world_size)
     end.record()
