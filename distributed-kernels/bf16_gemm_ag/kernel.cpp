@@ -232,15 +232,7 @@ void dispatch_ag_gemm(ag_globals g) {
         // Column offset: source_rank * (N_local / BLOCK_SIZE) in N_BLOCK units
         int col_offset_tiles = source_rank * (g.N_local / NEW_COL_BLOCK_SIZE) * N_BLOCK;
 
-        ag_kernel_args args;
-        args.a = g.a;
-        args.remote_b = remote_b;
-        args.c = g.c;
-        args.M = g.M;
-        args.N_local = g.N_local;
-        args.K = g.K;
-        args.col_offset_tiles = col_offset_tiles;
-
+        ag_kernel_args args{g.a, remote_b, g.c, g.M, g.N_local, g.K, col_offset_tiles};
         ag_gemm_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(args);
     }
 }
