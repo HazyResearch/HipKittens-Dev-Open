@@ -107,6 +107,21 @@ if rank == 0:
 if rank == 0:
     print("\n[Running AG-GEMM Kernel]")
 iris_device_ctx = iris.get_device_view()
+
+# Debug: verify iris backing and print pointer info
+a_iris_ptr = A._iris_tensor.data_ptr() if hasattr(A, '_iris_tensor') else 0
+b_iris_ptr = B_shard._iris_tensor.data_ptr() if hasattr(B_shard, '_iris_tensor') else 0
+c_iris_ptr = C._iris_tensor.data_ptr() if hasattr(C, '_iris_tensor') else 0
+print(f"Rank {rank}: A.data_ptr()=0x{A.data_ptr():x} (iris: 0x{a_iris_ptr:x}), "
+      f"B_shard.data_ptr()=0x{B_shard.data_ptr():x} (iris: 0x{b_iris_ptr:x}), "
+      f"C.data_ptr()=0x{C.data_ptr():x} (iris: 0x{c_iris_ptr:x})")
+# Check if torch tensor is backed by iris (same pointer)
+a_ok = A.data_ptr() == a_iris_ptr if a_iris_ptr else "no iris"
+b_ok = B_shard.data_ptr() == b_iris_ptr if b_iris_ptr else "no iris"
+c_ok = C.data_ptr() == c_iris_ptr if c_iris_ptr else "no iris"
+print(f"Rank {rank}: iris-backed: A={a_ok}, B_shard={b_ok}, C={c_ok}")
+iris.barrier()
+
 tk_kernel.dispatch_ag_gemm(A, B_shard, C, iris_device_ctx, M, N, K, N_local, world_size)
 torch.cuda.synchronize()
 iris.barrier()
