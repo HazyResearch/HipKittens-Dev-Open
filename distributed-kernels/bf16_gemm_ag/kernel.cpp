@@ -12,9 +12,6 @@ constexpr int HALF_BLOCK_SIZE = BLOCK_SIZE / 2; // 32
 constexpr int NEW_ROW_BLOCK_SIZE = BLOCK_SIZE * M_BLOCK;
 constexpr int NEW_COL_BLOCK_SIZE = BLOCK_SIZE * N_BLOCK;
 
-// Batch 2 ranks per K-pass to halve A re-reads
-constexpr int RANK_BATCH = 2;
-
 #define NUM_PRODUCER_WORKERS (4)
 #define NUM_CONSUMER_WORKERS (M_BLOCK * 4)
 #define NUM_THREADS ((NUM_PRODUCER_WORKERS + NUM_CONSUMER_WORKERS) * kittens::WARP_THREADS)
@@ -24,23 +21,23 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// All-Gather GEMM globals
-// C[M, N] = A[M, K] @ B_full[N, K]^T
-// B is column-sharded: each rank owns B_shard[N_local, K], N_local = N / world_size
+// All-Gather GEMM (K-sharded, iris pattern)
+// C[M, N] = sum_r( A_shard_r[M, K_local] @ B[N, K][:, r*K_local:(r+1)*K_local]^T )
+// A is K-sharded across ranks on iris heap. B is full, local. C is local.
 struct ag_globals {
-    gl<bf16, -1, -1, -1, -1> a;       // [M, K] - local, same on all ranks
-    gl<bf16, -1, -1, -1, -1> b_shard; // [N_local, K] - local shard of B
-    gl<bf16, -1, -1, -1, -1> c;       // [M, N] - full output, local
+    gl<bf16, -1, -1, -1, -1> a_shard; // [M, K_local] on iris heap
+    gl<bf16, -1, -1, -1, -1> b;       // [N, K] local
+    gl<bf16, -1, -1, -1, -1> c;       // [M, N] local output
     iris::iris_device_view iris_ctx;
 
     int M;
     int N;
     int K;
-    int N_local;
+    int K_local;
     int world_size;
 
     hipStream_t stream;
-    dim3 grid()  { return dim3(ceil_div(N_local, NEW_COL_BLOCK_SIZE),
+    dim3 grid()  { return dim3(ceil_div(N, NEW_COL_BLOCK_SIZE),
                               ceil_div(M, NEW_ROW_BLOCK_SIZE)); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return 98304; }
@@ -56,10 +53,7 @@ void ag_gemm_tk(ag_globals g) {
     using ST_B = st_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>;
     ST_A (&As)[2][M_BLOCK][2] = al.allocate<ST_A, 2, M_BLOCK, 2>();
     ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
-
-    // 2 sets of accumulators for RANK_BATCH=2
-    rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C0_accum[2][2]; // rank batch 0
-    rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C1_accum[2][2]; // rank batch 1
+    rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
 
     // Workgroup ID + swizzle
     int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
@@ -67,7 +61,7 @@ void ag_gemm_tk(ag_globals g) {
     const int WGM = 4;
     wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
     const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
-    const int num_pid_n = ceil_div(g.N_local, NEW_COL_BLOCK_SIZE);
+    const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
     const int num_wgid_in_group = WGM * num_pid_n;
     int group_id = wgid / num_wgid_in_group;
     int first_pid_m = group_id * WGM;
@@ -86,10 +80,9 @@ void ag_gemm_tk(ag_globals g) {
 
     // Pointer translation setup
     int cur_rank = g.iris_ctx.cur_rank();
-    int world_size = g.iris_ctx.world_size();
     uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
-    int n_local_tiles_per_rank = (g.N_local / NEW_COL_BLOCK_SIZE) * N_BLOCK;
-    int num_tiles = g.K / BLOCK_SIZE;
+    int K_local_tiles = g.K_local / BLOCK_SIZE;
+    int total_k_tiles = g.K / BLOCK_SIZE;
 
     using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>::dtype;
     constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<T>();
@@ -97,188 +90,139 @@ void ag_gemm_tk(ag_globals g) {
     constexpr int memcpy_per_tile = BLOCK_SIZE * BLOCK_SIZE * sizeof(T) / bytes_per_memcpy;
     uint32_t swizzled_offsets_A[memcpy_per_tile];
     uint32_t swizzled_offsets_B[memcpy_per_tile];
-    G::prefill_swizzled_offsets(As[0][0][0], g.a, swizzled_offsets_A);
-    G::prefill_swizzled_offsets(Bs[0][0][0], g.b_shard, swizzled_offsets_B);
+    G::prefill_swizzled_offsets(As[0][0][0], g.a_shard, swizzled_offsets_A);
+    G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
 
-    // Process ranks in batches of RANK_BATCH=2
-    // For each batch: iterate K tiles, load A once, load B from 2 remote ranks
-    for (int rank_base = 0; rank_base < world_size; rank_base += RANK_BATCH) {
-        int r0 = rank_base;
-        int r1 = rank_base + 1;
-        // Handle odd world_size: if r1 >= world_size, we only process r0
-        bool has_r1 = (r1 < world_size);
+    // Set up remote A pointer for rank 0
+    gl<bf16, -1, -1, -1, -1> remote_a = g.a_shard;
+    {
+        uintptr_t base0 = g.iris_ctx.get_heap_base(0);
+        intptr_t delta = (intptr_t)base0 - (intptr_t)local_base;
+        remote_a.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.a_shard.raw_ptr + delta);
+    }
+    int cur_source_rank = 0;
 
-        // Translate pointers for both ranks
-        uintptr_t remote_base0 = g.iris_ctx.get_heap_base(r0);
-        intptr_t delta0 = (intptr_t)remote_base0 - (intptr_t)local_base;
-        gl<bf16, -1, -1, -1, -1> remote_b0 = g.b_shard;
-        remote_b0.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.b_shard.raw_ptr + delta0);
-
-        gl<bf16, -1, -1, -1, -1> remote_b1 = g.b_shard;
-        if (has_r1) {
-            uintptr_t remote_base1 = g.iris_ctx.get_heap_base(r1);
-            intptr_t delta1 = (intptr_t)remote_base1 - (intptr_t)local_base;
-            remote_b1.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.b_shard.raw_ptr + delta1);
+    // Prefetch tile 0: A from rank 0 (local_k=0), B at global_k=0
+    if (is_producer) {
+        #pragma unroll
+        for (int m = 0; m < M_BLOCK; m++) {
+            G::load<2, false>(As[0][m][0], remote_a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[0][m][1], remote_a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
         }
-
-        // Zero accumulators
-        if (is_consumer) {
-            zero(C0_accum[0][0]); zero(C0_accum[0][1]);
-            zero(C0_accum[1][0]); zero(C0_accum[1][1]);
-            zero(C1_accum[0][0]); zero(C1_accum[0][1]);
-            zero(C1_accum[1][0]); zero(C1_accum[1][1]);
+        #pragma unroll
+        for (int n = 0; n < N_BLOCK; n++) {
+            G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
         }
+        __builtin_amdgcn_s_waitcnt(0);
+    }
+    __syncthreads();
 
-        // ── K-tile loop: load A once, compute against both B shards ──
-        //
-        // Buffer assignment:
-        //   Bs[0] = always B_r0 data
-        //   Bs[1] = always B_r1 data
-        //   As[tic/toc] = ping-pong A across K-tiles
-        //
-        // Phase 1: Producers load B_r1[tile] -> Bs[1].
-        //          Consumers compute C0 += As[tic] * Bs[0].
-        //          Barrier.
-        // Phase 2: Producers load A[tile+1] -> As[toc], B_r0[tile+1] -> Bs[0].
-        //          Consumers compute C1 += As[tic] * Bs[1].
-        //          Safe: consumers read As[tic]/Bs[1], producers write As[toc]/Bs[0].
-        //          Barrier + tic/toc swap.
+    if (is_consumer) {
+        zero(C_accum[0][0]);
+        zero(C_accum[0][1]);
+        zero(C_accum[1][0]);
+        zero(C_accum[1][1]);
+    }
 
-        int tic = 0, toc = 1;
+    int tic = 0, toc = 1;
 
-        // Prefetch first A tile and B_r0 tile 0
+    // Main K-tile loop — flat over all ranks
+    // tile 0..K_local_tiles-1 = rank 0, K_local_tiles..2*K_local_tiles-1 = rank 1, etc.
+    for (int tile = 0; tile < total_k_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
+        int next_tile = tile + 1;
+        int next_rank = next_tile / K_local_tiles;
+        int next_local_k = next_tile % K_local_tiles;
+
         if (is_producer) {
+            // Update remote A pointer if we crossed a rank boundary
+            if (next_rank != cur_source_rank) {
+                cur_source_rank = next_rank;
+                uintptr_t base_next = g.iris_ctx.get_heap_base(next_rank);
+                intptr_t delta = (intptr_t)base_next - (intptr_t)local_base;
+                remote_a.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.a_shard.raw_ptr + delta);
+            }
+
+            // Prefetch next A tile (remote) and B tile (local)
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
-                G::load<2, false>(As[0][m][0], g.a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
-                G::load<2, false>(As[0][m][1], g.a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][0], remote_a, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][1], remote_a, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
             }
-            // B_r0 always in Bs[0]
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
-                G::load<2, false>(Bs[0][n][0], remote_b0, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
-                G::load<2, false>(Bs[0][n][1], remote_b0, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_tile}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_tile}, swizzled_offsets_B);
             }
             __builtin_amdgcn_s_waitcnt(0);
+        } else if (is_consumer) {
+            A_slice a0;
+            B_slice b0, b1;
+
+            auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+            load(b0, st_b);
+            auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+            load(b1, st_b);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+            mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+            __builtin_amdgcn_s_setprio(0);
         }
-        __syncthreads();
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+    }
 
-        for (int tile = 0; tile < num_tiles; tile++, tic ^= 1, toc ^= 1) {
-            // ── Phase 1: Compute C0 += A * B_r0^T while prefetching B_r1 ──
+    // Last tile — no prefetch needed
+    if (is_consumer) {
+        A_slice a0;
+        B_slice b0, b1;
 
-            if (is_producer && has_r1) {
-                // Load B_r1[tile] -> Bs[1] (fixed slot)
-                #pragma unroll
-                for (int n = 0; n < N_BLOCK; n++) {
-                    G::load<2, false>(Bs[1][n][0], remote_b1, {0, 0, col*2 + 2*n + 0, tile}, swizzled_offsets_B);
-                    G::load<2, false>(Bs[1][n][1], remote_b1, {0, 0, col*2 + 2*n + 1, tile}, swizzled_offsets_B);
-                }
-                __builtin_amdgcn_s_waitcnt(0);
-            } else if (is_consumer) {
-                // C0 += As[tic] * Bs[0]  (A from ping-pong, B_r0 from fixed slot 0)
-                A_slice a0;
-                B_slice b0, b1;
+        auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+        load(b0, st_b);
+        auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+        load(a0, st_a);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+        __builtin_amdgcn_s_setprio(0);
 
-                auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[0][local_warp_id][0], {0, 0});
-                load(b0, st_b);
-                auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
-                load(a0, st_a);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C0_accum[0][0], a0, b0, C0_accum[0][0]);
-                __builtin_amdgcn_s_setprio(0);
+        st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+        load(b1, st_b);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+        __builtin_amdgcn_s_setprio(0);
 
-                st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[0][local_warp_id][1], {0, 0});
-                load(b1, st_b);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C0_accum[0][1], a0, b1, C0_accum[0][1]);
-                __builtin_amdgcn_s_setprio(0);
+        st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+        load(a0, st_a);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+        mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+        __builtin_amdgcn_s_setprio(0);
+    }
 
-                st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
-                load(a0, st_a);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C0_accum[1][0], a0, b0, C0_accum[1][0]);
-                mma_ABt(C0_accum[1][1], a0, b1, C0_accum[1][1]);
-                __builtin_amdgcn_s_setprio(0);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-            __builtin_amdgcn_s_barrier();
-
-            if (!has_r1) continue;
-
-            // ── Phase 2: Compute C1 += A * B_r1^T while prefetching next A + B_r0 ──
-            // Consumers read: As[tic], Bs[1]
-            // Producers write: As[toc], Bs[0]  — no conflicts!
-
-            if (is_producer) {
-                if (tile + 1 < num_tiles) {
-                    // Load next A tile -> As[toc]
-                    #pragma unroll
-                    for (int m = 0; m < M_BLOCK; m++) {
-                        G::load<2, false>(As[toc][m][0], g.a, {0, 0, row*2 + 2*m + 0, tile + 1}, swizzled_offsets_A);
-                        G::load<2, false>(As[toc][m][1], g.a, {0, 0, row*2 + 2*m + 1, tile + 1}, swizzled_offsets_A);
-                    }
-                    // Load B_r0[tile+1] -> Bs[0]
-                    #pragma unroll
-                    for (int n = 0; n < N_BLOCK; n++) {
-                        G::load<2, false>(Bs[0][n][0], remote_b0, {0, 0, col*2 + 2*n + 0, tile + 1}, swizzled_offsets_B);
-                        G::load<2, false>(Bs[0][n][1], remote_b0, {0, 0, col*2 + 2*n + 1, tile + 1}, swizzled_offsets_B);
-                    }
-                }
-                __builtin_amdgcn_s_waitcnt(0);
-            } else if (is_consumer) {
-                // C1 += As[tic] * Bs[1]  (A from current tile, B_r1 from fixed slot 1)
-                A_slice a0;
-                B_slice b0, b1;
-
-                auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[1][local_warp_id][0], {0, 0});
-                load(b0, st_b);
-                auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
-                load(a0, st_a);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C1_accum[0][0], a0, b0, C1_accum[0][0]);
-                __builtin_amdgcn_s_setprio(0);
-
-                st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[1][local_warp_id][1], {0, 0});
-                load(b1, st_b);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C1_accum[0][1], a0, b1, C1_accum[0][1]);
-                __builtin_amdgcn_s_setprio(0);
-
-                st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
-                load(a0, st_a);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                __builtin_amdgcn_s_setprio(1);
-                mma_ABt(C1_accum[1][0], a0, b0, C1_accum[1][0]);
-                mma_ABt(C1_accum[1][1], a0, b1, C1_accum[1][1]);
-                __builtin_amdgcn_s_setprio(0);
-            }
-            __builtin_amdgcn_sched_barrier(0);
-            __builtin_amdgcn_s_barrier();
-        }
-
-        // Store C0 (rank r0's contribution)
-        if (is_consumer) {
-            int c_col0 = r0 * n_local_tiles_per_rank + col;
-            store(g.c, C0_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, c_col0 * 2 + local_warp_id * 2 + 0});
-            store(g.c, C0_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, c_col0 * 2 + local_warp_id * 2 + 1});
-            store(g.c, C0_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, c_col0 * 2 + local_warp_id * 2 + 0});
-            store(g.c, C0_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, c_col0 * 2 + local_warp_id * 2 + 1});
-        }
-
-        // Store C1 (rank r1's contribution)
-        if (is_consumer && has_r1) {
-            int c_col1 = r1 * n_local_tiles_per_rank + col;
-            store(g.c, C1_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, c_col1 * 2 + local_warp_id * 2 + 0});
-            store(g.c, C1_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, c_col1 * 2 + local_warp_id * 2 + 1});
-            store(g.c, C1_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, c_col1 * 2 + local_warp_id * 2 + 0});
-            store(g.c, C1_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, c_col1 * 2 + local_warp_id * 2 + 1});
-        }
-        __syncthreads();
+    // Store C — local, one write
+    if (is_consumer) {
+        store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
+        store(g.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
     }
 }
 
@@ -289,16 +233,16 @@ void dispatch_ag_gemm(ag_globals g) {
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — all-gather GEMM";
+    m.doc() = "tk_kernel python module — all-gather GEMM (K-sharded)";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
-        &ag_globals::a,
-        &ag_globals::b_shard,
+        &ag_globals::a_shard,
+        &ag_globals::b,
         &ag_globals::c,
         &ag_globals::iris_ctx,
         &ag_globals::M,
         &ag_globals::N,
         &ag_globals::K,
-        &ag_globals::N_local,
+        &ag_globals::K_local,
         &ag_globals::world_size
     );
 }
