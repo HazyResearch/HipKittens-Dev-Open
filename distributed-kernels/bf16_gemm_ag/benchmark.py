@@ -1,4 +1,4 @@
-"""Benchmark: AG-GEMM kernel (K-sharded) vs torch.distributed.all_gather + torch.matmul"""
+"""Benchmark: AG-GEMM kernel (staged) vs torch.distributed.all_gather + torch.matmul"""
 import torch
 import ctypes
 import time
@@ -62,7 +62,7 @@ configs = [
 
 if rank == 0:
     print("="*80)
-    print(f"AG-GEMM Benchmark (K-sharded): HipKittens vs torch.distributed.all_gather + matmul")
+    print(f"AG-GEMM Benchmark (staged): HipKittens vs torch.distributed.all_gather + matmul")
     print(f"Device: {torch.cuda.get_device_name()}, World size: {world_size}")
     print(f"Warmup: {WARMUP}, Measured: {ITERS}")
     print("="*80)
@@ -78,7 +78,7 @@ for M, K, N in configs:
 
     # ── Allocate iris tensors ──
     A_shard_iris = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
-    # B and C are local (not on iris heap)
+    A_staging = torch.empty(M, K_local, dtype=torch.bfloat16, device='cuda')
     B_iris = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
     C_iris = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
@@ -96,12 +96,12 @@ for M, K, N in configs:
     iris.barrier()
     dist.barrier()
 
-    # ── Benchmark: HipKittens AG-GEMM ──
+    # ── Benchmark: HipKittens AG-GEMM (staged) ──
     iris_device_ctx = iris.get_device_view()
 
     for _ in range(WARMUP):
-        tk_kernel.dispatch_ag_gemm(A_shard_iris, B_iris, C_iris, iris_device_ctx,
-                                   M, N, K, K_local, world_size)
+        tk_kernel.dispatch_ag_gemm(A_shard_iris, A_staging, B_iris, C_iris,
+                                   iris_device_ctx, M, N, K, K_local, world_size)
     torch.cuda.synchronize()
     iris.barrier()
 
@@ -109,8 +109,8 @@ for M, K, N in configs:
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(ITERS):
-        tk_kernel.dispatch_ag_gemm(A_shard_iris, B_iris, C_iris, iris_device_ctx,
-                                   M, N, K, K_local, world_size)
+        tk_kernel.dispatch_ag_gemm(A_shard_iris, A_staging, B_iris, C_iris,
+                                   iris_device_ctx, M, N, K, K_local, world_size)
     end.record()
     torch.cuda.synchronize()
     iris.barrier()
@@ -147,7 +147,7 @@ for M, K, N in configs:
               f"{tk_ms:9.3f}  {torch_ms:10.3f}  {speedup:6.2f}x  {tk_tflops:10.2f}  {torch_tflops:13.2f}")
 
     # Cleanup per-config
-    del A_shard_iris, B_iris, C_iris, iris_device_ctx
+    del A_shard_iris, A_staging, B_iris, C_iris, iris_device_ctx
     del A_shard_torch, B_torch, C_torch, A_shards_list
     import gc; gc.collect()
     torch.cuda.synchronize()

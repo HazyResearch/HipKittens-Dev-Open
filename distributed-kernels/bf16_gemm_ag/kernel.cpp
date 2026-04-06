@@ -6,7 +6,6 @@ using namespace kittens;
 constexpr int BLOCK_SIZE = 64;
 constexpr int M_BLOCK = 2;
 constexpr int N_BLOCK = 4;
-constexpr int DOT_SLICE = 32;
 constexpr int HALF_BLOCK_SIZE = BLOCK_SIZE / 2; // 32
 
 constexpr int NEW_ROW_BLOCK_SIZE = BLOCK_SIZE * M_BLOCK;
@@ -21,13 +20,15 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// All-Gather GEMM (K-sharded, iris pattern)
-// C[M, N] = sum_r( A_shard_r[M, K_local] @ B[N, K][:, r*K_local:(r+1)*K_local]^T )
-// A is K-sharded across ranks on iris heap. B is full, local. C is local.
+// All-Gather GEMM with Local Staging Buffer
+// Strategy: for each source rank r:
+//   1. Bulk copy A_shard[r] from remote XGMI → local staging buffer (HBM)
+//   2. GEMM: C += staging_A @ B[:, r*K_local:(r+1)*K_local]^T (all local HBM reads)
 struct ag_globals {
-    gl<bf16, -1, -1, -1, -1> a_shard; // [M, K_local] on iris heap
-    gl<bf16, -1, -1, -1, -1> b;       // [N, K] local
-    gl<bf16, -1, -1, -1, -1> c;       // [M, N] local output
+    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
+    gl<bf16, -1, -1, -1, -1> a_staging; // [M, K_local] local HBM staging buffer
+    gl<bf16, -1, -1, -1, -1> b;         // [N, K] local
+    gl<bf16, -1, -1, -1, -1> c;         // [M, N] local output
     iris::iris_device_view iris_ctx;
 
     int M;
@@ -43,8 +44,29 @@ struct ag_globals {
     size_t dynamic_shared_memory() { return 98304; }
 };
 
+// Bulk vectorized copy kernel: remote A shard → local staging buffer
+// Uses int4 (16 bytes = 8 bf16 elements) for maximum memory bandwidth
+__global__ void copy_a_to_staging(bf16* __restrict__ dst,
+                                  const bf16* __restrict__ src,
+                                  int num_elements) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    // Vectorized copy: 8 bf16 = 16 bytes per int4
+    int4* dst4 = reinterpret_cast<int4*>(dst);
+    const int4* src4 = reinterpret_cast<const int4*>(src);
+    int num_vec = num_elements / 8;
+
+    for (int i = tid; i < num_vec; i += stride) {
+        dst4[i] = src4[i];
+    }
+}
+
+// Per-rank GEMM kernel: processes K_local tiles for one source rank
+// Reads A from LOCAL staging buffer (fast HBM), B from local memory
+// For source_rank > 0: loads existing C to accumulate
 __global__ __launch_bounds__(NUM_THREADS, 2)
-void ag_gemm_tk(ag_globals g) {
+void ag_gemm_staged(ag_globals g, int source_rank) {
 
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
@@ -78,11 +100,8 @@ void ag_gemm_tk(ag_globals g) {
     bool is_consumer = (warp_group_id > 0 && warp_group_id <= M_BLOCK);
     int consumer_idx = is_consumer ? warp_group_id - 1 : 0;
 
-    // Pointer translation setup
-    int cur_rank = g.iris_ctx.cur_rank();
-    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
     int K_local_tiles = g.K_local / BLOCK_SIZE;
-    int total_k_tiles = g.K / BLOCK_SIZE;
+    int k_offset = source_rank * K_local_tiles; // Global B K-tile offset
 
     using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>::dtype;
     constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<T>();
@@ -90,69 +109,59 @@ void ag_gemm_tk(ag_globals g) {
     constexpr int memcpy_per_tile = BLOCK_SIZE * BLOCK_SIZE * sizeof(T) / bytes_per_memcpy;
     uint32_t swizzled_offsets_A[memcpy_per_tile];
     uint32_t swizzled_offsets_B[memcpy_per_tile];
-    G::prefill_swizzled_offsets(As[0][0][0], g.a_shard, swizzled_offsets_A);
+    // A reads from LOCAL staging buffer (not remote)
+    G::prefill_swizzled_offsets(As[0][0][0], g.a_staging, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
 
-    // Set up remote A pointer for rank 0
-    gl<bf16, -1, -1, -1, -1> remote_a = g.a_shard;
-    {
-        uintptr_t base0 = g.iris_ctx.get_heap_base(0);
-        intptr_t delta = (intptr_t)base0 - (intptr_t)local_base;
-        remote_a.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.a_shard.raw_ptr + delta);
-    }
-    int cur_source_rank = 0;
-
-    // Prefetch tile 0: A from rank 0 (local_k=0), B at global_k=0
+    // Prefetch tile 0: A from LOCAL staging, B at global K offset
     if (is_producer) {
         #pragma unroll
         for (int m = 0; m < M_BLOCK; m++) {
-            G::load<2, false>(As[0][m][0], remote_a, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
-            G::load<2, false>(As[0][m][1], remote_a, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[0][m][0], g.a_staging, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[0][m][1], g.a_staging, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
         }
         #pragma unroll
         for (int n = 0; n < N_BLOCK; n++) {
-            G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
-            G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, k_offset + 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, k_offset + 0}, swizzled_offsets_B);
         }
         __builtin_amdgcn_s_waitcnt(0);
     }
     __syncthreads();
 
     if (is_consumer) {
-        zero(C_accum[0][0]);
-        zero(C_accum[0][1]);
-        zero(C_accum[1][0]);
-        zero(C_accum[1][1]);
+        if (source_rank == 0) {
+            // First rank: zero accumulators
+            zero(C_accum[0][0]);
+            zero(C_accum[0][1]);
+            zero(C_accum[1][0]);
+            zero(C_accum[1][1]);
+        } else {
+            // Subsequent ranks: load existing C (bf16→float32 conversion is automatic)
+            load(C_accum[0][0], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
+            load(C_accum[0][1], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
+            load(C_accum[1][0], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
+            load(C_accum[1][1], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
+        }
     }
 
     int tic = 0, toc = 1;
 
-    // Main K-tile loop — flat over all ranks
-    // tile 0..K_local_tiles-1 = rank 0, K_local_tiles..2*K_local_tiles-1 = rank 1, etc.
-    for (int tile = 0; tile < total_k_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
-        int next_tile = tile + 1;
-        int next_rank = next_tile / K_local_tiles;
-        int next_local_k = next_tile % K_local_tiles;
+    // K-tile loop over this rank's K_local tiles
+    for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
+        int next_local_k = tile + 1;
 
         if (is_producer) {
-            // Update remote A pointer if we crossed a rank boundary
-            if (next_rank != cur_source_rank) {
-                cur_source_rank = next_rank;
-                uintptr_t base_next = g.iris_ctx.get_heap_base(next_rank);
-                intptr_t delta = (intptr_t)base_next - (intptr_t)local_base;
-                remote_a.raw_ptr = reinterpret_cast<bf16*>((uintptr_t)g.a_shard.raw_ptr + delta);
-            }
-
-            // Prefetch next A tile (remote) and B tile (local)
+            // Prefetch next A tile from LOCAL staging + B tile
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
-                G::load<2, false>(As[toc][m][0], remote_a, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
-                G::load<2, false>(As[toc][m][1], remote_a, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][0], g.a_staging, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][1], g.a_staging, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
             }
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
-                G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_tile}, swizzled_offsets_B);
-                G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_tile}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, k_offset + next_local_k}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, k_offset + next_local_k}, swizzled_offsets_B);
             }
             __builtin_amdgcn_s_waitcnt(0);
         } else if (is_consumer) {
@@ -217,7 +226,7 @@ void ag_gemm_tk(ag_globals g) {
         __builtin_amdgcn_s_setprio(0);
     }
 
-    // Store C — local, one write
+    // Store C
     if (is_consumer) {
         store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
         store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
@@ -228,14 +237,40 @@ void ag_gemm_tk(ag_globals g) {
 
 void dispatch_ag_gemm(ag_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
-    hipFuncSetAttribute((void*)ag_gemm_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    ag_gemm_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+    hipFuncSetAttribute((void*)ag_gemm_staged,
+                        hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+
+    int cur_rank = g.iris_ctx.cur_rank();
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+    int shard_bytes = g.M * g.K_local * sizeof(bf16);
+
+    // Copy kernel config: 256 blocks × 256 threads = 65536 threads
+    // Each thread copies 16 bytes (int4), total bandwidth per launch ≈ 1 MB
+    // For 7680×1024×2 = 15 MB shard, ~15 iterations per thread
+    int copy_blocks = 256;
+    int copy_threads = 256;
+
+    for (int r = 0; r < g.world_size; r++) {
+        // Compute remote A pointer for rank r
+        uintptr_t base_r = g.iris_ctx.get_heap_base(r);
+        intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
+        bf16* remote_a = reinterpret_cast<bf16*>(
+            (uintptr_t)g.a_shard.raw_ptr + delta);
+
+        // Phase 1: bulk copy remote A → local staging (XGMI transfer)
+        copy_a_to_staging<<<copy_blocks, copy_threads, 0, g.stream>>>(
+            g.a_staging.raw_ptr, remote_a, g.M * g.K_local);
+
+        // Phase 2: GEMM with all-local reads
+        ag_gemm_staged<<<g.grid(), g.block(), mem_size, g.stream>>>(g, r);
+    }
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — all-gather GEMM (K-sharded)";
+    m.doc() = "tk_kernel python module — all-gather GEMM with local staging";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
+        &ag_globals::a_staging,
         &ag_globals::b,
         &ag_globals::c,
         &ag_globals::iris_ctx,

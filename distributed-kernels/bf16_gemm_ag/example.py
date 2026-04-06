@@ -54,8 +54,9 @@ K_local = K // world_size
 
 if rank == 0:
     print("="*60)
-    print(f"All-Gather GEMM (K-sharded): C[{M},{N}] = sum_r(A_shard_r[{M},{K_local}] @ B[{N},{K}]^T)")
+    print(f"All-Gather GEMM (K-sharded, staged): C[{M},{N}] = sum_r(A_shard_r[{M},{K_local}] @ B[{N},{K}]^T)")
     print(f"A K-sharded: A_shard[{M},{K_local}] per rank, {world_size} ranks")
+    print(f"Using local staging buffer for XGMI→HBM copy")
     print("="*60)
 
 # Allocate A_shard on iris heap (remote-accessible)
@@ -63,12 +64,17 @@ if rank == 0:
     print("\n[Allocating Tensors]")
 A_shard = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
 
-# B and C are local — regular CUDA memory (not on iris heap)
+# Staging buffer: local HBM (not on iris heap), same shape as A_shard
+A_staging = torch.empty(M, K_local, dtype=torch.bfloat16, device='cuda')
+
+# B and C are local — regular CUDA memory
 B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
 C = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
 if rank == 0:
-    print(f"  A_shard: {A_shard.shape} (iris heap), B: {B.shape} (local), C: {C.shape} (local)")
+    print(f"  A_shard: {A_shard.shape} (iris heap)")
+    print(f"  A_staging: {A_staging.shape} (local HBM staging)")
+    print(f"  B: {B.shape} (local), C: {C.shape} (local)")
 
 # Verify iris backing for A_shard
 iris_ok = (A_shard.data_ptr() == A_shard._iris_tensor.data_ptr())
@@ -94,13 +100,14 @@ C_ref = torch.matmul(A_full, B.t())     # [M, N]
 if rank == 0:
     print(f"  A_full: {A_full.shape}, C_ref: {C_ref.shape}")
 
-# Run AG-GEMM kernel
+# Run AG-GEMM kernel (staged)
 if rank == 0:
-    print("\n[Running AG-GEMM Kernel (K-sharded)]")
+    print("\n[Running AG-GEMM Kernel (staged, K-sharded)]")
 iris_device_ctx = iris.get_device_view()
 iris.barrier()
 
-tk_kernel.dispatch_ag_gemm(A_shard, B, C, iris_device_ctx, M, N, K, K_local, world_size)
+tk_kernel.dispatch_ag_gemm(A_shard, A_staging, B, C, iris_device_ctx,
+                           M, N, K, K_local, world_size)
 torch.cuda.synchronize()
 iris.barrier()
 
@@ -121,7 +128,7 @@ if rank == 0:
 # Cleanup
 import gc
 from mpi4py import MPI
-del A_shard, B, C, A_full, C_ref, A_full_list
+del A_shard, A_staging, B, C, A_full, C_ref, A_full_list
 gc.collect()
 torch.cuda.synchronize()
 iris.barrier()
