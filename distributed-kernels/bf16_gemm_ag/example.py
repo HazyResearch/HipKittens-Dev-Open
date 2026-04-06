@@ -10,27 +10,48 @@ def make_iris_tensor(iris, shape, dtype="bfloat16"):
     """Create a PyTorch tensor backed by iris fine-grained memory.
 
     Allocates on the iris symmetric heap and creates a zero-copy
-    torch tensor via torch.from_blob (ROCm/HIP treats iris memory
-    as a valid device pointer).
+    torch tensor via __cuda_array_interface__ + view().
     """
     dtype_map = {
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float32": torch.float32,
-        "float16": torch.float16,
+        "bfloat16": (torch.bfloat16, torch.uint16),
+        "bf16": (torch.bfloat16, torch.uint16),
+        "float32": (torch.float32, None),
+        "float16": (torch.float16, None),
     }
-    torch_dtype = dtype_map[dtype]
+    torch_dtype, view_via = dtype_map[dtype]
 
     iris_tensor = iris.empty(shape, dtype=dtype)
     ptr = iris_tensor.data_ptr()
-    numel = 1
-    for s in shape:
-        numel *= s
 
-    # Create a torch tensor that directly wraps the iris device pointer
-    # torch.from_blob works with device pointers on ROCm
-    t = torch.from_blob(ctypes.c_void_p(ptr), shape, dtype=torch_dtype, device='cuda')
-    # Prevent iris_tensor from being garbage collected
+    # For types with no direct __cuda_array_interface__ typestr (bfloat16),
+    # wrap as uint16 first, then .view(torch.bfloat16) which is zero-copy
+    if view_via is not None:
+        # Wrap as uint16 (same size as bfloat16, "<u2")
+        class CudaArrayWrapper:
+            def __init__(self):
+                self.__cuda_array_interface__ = {
+                    'shape': tuple(shape),
+                    'typestr': '<u2',
+                    'data': (ptr, False),
+                    'version': 3,
+                    'strides': None,
+                }
+        t = torch.as_tensor(CudaArrayWrapper(), device=f'cuda:{iris.rank()}')
+        # view() is zero-copy — same underlying data pointer
+        t = t.view(torch_dtype)
+    else:
+        typestr_map = {torch.float32: '<f4', torch.float16: '<f2'}
+        class CudaArrayWrapper:
+            def __init__(self):
+                self.__cuda_array_interface__ = {
+                    'shape': tuple(shape),
+                    'typestr': typestr_map[torch_dtype],
+                    'data': (ptr, False),
+                    'version': 3,
+                    'strides': None,
+                }
+        t = torch.as_tensor(CudaArrayWrapper(), device=f'cuda:{iris.rank()}')
+
     t._iris_tensor = iris_tensor
     return t
 
