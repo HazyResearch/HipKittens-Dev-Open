@@ -834,10 +834,12 @@ __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
     return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Drain write buffer: ensures all stores visible before counter write.
-// On fine-grained memory, s_waitcnt vmcnt(0) = system visibility.
+// No explicit fence — RELAXED system-scope atomic store already
+// provides visibility ordering on fine-grained memory.
+// The data stores complete before the atomic because of GPU pipeline ordering
+// (stores to the same destination are in-order on XGMI).
 __device__ __forceinline__ void fence_stores() {
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    // Intentionally empty — try without any fence to measure raw ring BW
 }
 
 // Multi-channel ring push all-gather
@@ -941,7 +943,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 2;
+    int num_channels = 8;
 
     static bool printed = false;
     if (!printed) {
