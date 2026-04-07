@@ -144,6 +144,9 @@ void ag_gemm_persistent(ag_globals g) {
     const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
     const int WGM = 4;
 
+    // Accumulators — declared outside loop to reduce register pressure
+    rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
+
     // ── Persistent tile loop ──
     while (true) {
         // Thread 0 grabs next tile, broadcasts via shared memory
@@ -170,7 +173,6 @@ void ag_gemm_persistent(ag_globals g) {
         int col = pid_n * N_BLOCK;
 
         // Zero accumulators for this tile
-        rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
         if (is_consumer) {
             zero(C_accum[0][0]);
             zero(C_accum[0][1]);
