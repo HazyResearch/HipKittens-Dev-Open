@@ -959,7 +959,9 @@ void dispatch_push_ring_ag(ag_globals g) {
 // Step 0: push own shard to local a_local + next rank's a_local
 // Step 1..W-3: forward shard from local a_local to next rank's a_local
 // Step W-2: no push needed (prev rank pushed directly into our a_local)
-void dispatch_push_ring_step(ag_globals g, int step) {
+// NOTE: step is passed via num_output_tiles (overloaded) to reuse BIND_AG_GLOBALS
+void dispatch_push_ring_step(ag_globals g) {
+    int step = g.num_output_tiles;  // overloaded: Python passes step here
     int shard_elements = g.M * g.K_local;
     int cur_rank = g.iris_ctx.cur_rank();
     uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
@@ -1029,26 +1031,6 @@ PYBIND11_MODULE(tk_kernel, m) {
     py::bind_function<dispatch_push_ring_ag_gemm>(m, "dispatch_push_ring_ag_gemm", BIND_AG_GLOBALS);
 
     // Host-side ring: per-step dispatch with iris.barrier() between steps
-    m.def("dispatch_push_ring_step", [](py::object<int> a_shard, py::object<int> a_local,
-                                         py::object<int> b, py::object<int> c,
-                                         py::object<int> iris_ctx_obj,
-                                         int M, int N, int K, int K_local,
-                                         int world_size, uintptr_t counters_ptr,
-                                         uintptr_t work_counter_ptr,
-                                         int num_output_tiles, int step) {
-        using gl_type = gl<bf16, -1, -1, -1, -1>;
-        ag_globals g;
-        g.a_shard = py::from_object<gl_type>::make(a_shard);
-        g.a_local = py::from_object<gl_type>::make(a_local);
-        g.b = py::from_object<gl_type>::make(b);
-        g.c = py::from_object<gl_type>::make(c);
-        g.iris_ctx = py::from_object<iris::iris_device_view>::make(iris_ctx_obj);
-        g.M = M; g.N = N; g.K = K; g.K_local = K_local;
-        g.world_size = world_size;
-        g.counters_ptr = counters_ptr;
-        g.work_counter_ptr = work_counter_ptr;
-        g.num_output_tiles = num_output_tiles;
-        g.stream = 0;
-        dispatch_push_ring_step(g, step);
-    });
+    // Python passes 'step' as the num_output_tiles argument (overloaded)
+    py::bind_function<dispatch_push_ring_step>(m, "dispatch_push_ring_step", BIND_AG_GLOBALS);
 }

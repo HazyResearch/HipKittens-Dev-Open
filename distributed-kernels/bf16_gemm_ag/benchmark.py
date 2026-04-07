@@ -125,9 +125,10 @@ for M, K, N in configs:
 
     def call_host_ring_ag():
         for step in range(world_size - 1):
+            # step is passed as num_output_tiles (overloaded)
             tk_kernel.dispatch_push_ring_step(A_shard_iris, A_local, B, C,
                                                iris_device_ctx, M, N, K, K_local, world_size,
-                                               sync_counters_ptr, work_ptr, num_output_tiles, step)
+                                               sync_counters_ptr, work_ptr, step)
             torch.cuda.synchronize()
             iris.barrier()
 
