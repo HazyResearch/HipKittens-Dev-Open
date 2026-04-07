@@ -823,20 +823,17 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 
 #define PUSH_RING_THREADS 1024
 
-// Counter write: release store with system scope
-// On fine-grained memory this is visible across XGMI
+// RCCL skip_fence pattern: nontemporal for counters, s_waitcnt for data
 __device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
-    __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    __builtin_nontemporal_store(val, ptr);
 }
 
-// Counter read: acquire load with system scope
 __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+    return __builtin_nontemporal_load(ptr);
 }
 
-// Data fence: drain write buffer so data is visible before counter
-// Using s_waitcnt vmcnt(0) — lighter than __threadfence_system()
-// On fine-grained memory, draining the write buffer = system visibility
+// Drain write buffer: s_waitcnt vmcnt(0) ensures all stores are visible
+// before the counter store. On fine-grained memory, this = system visibility.
 __device__ __forceinline__ void fence_stores() {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
