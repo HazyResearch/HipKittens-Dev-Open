@@ -823,19 +823,16 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 
 #define PUSH_RING_THREADS 1024
 
-// Counter store: RELEASE + SYSTEM scope — acts as release fence for prior stores
 __device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
-    __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Counter read: ACQUIRE + SYSTEM scope — acts as acquire fence for subsequent loads
 __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// No explicit fence — RELEASE/ACQUIRE on counters provides ordering
 __device__ __forceinline__ void fence_stores() {
-    // Empty: rely on RELEASE store providing release semantics
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
 // Multi-channel ring push all-gather
@@ -931,7 +928,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 2;
+    int num_channels = 4;
 
     static bool printed = false;
     if (!printed) {
