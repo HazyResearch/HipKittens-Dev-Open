@@ -148,9 +148,6 @@ void ag_gemm_persistent(ag_globals g) {
     // Accumulators — declared outside loop to reduce register pressure
     rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
 
-    // DEBUG: skip Phase 2 to verify Phase 1 completes
-    return;
-
     // ── Persistent tile loop ──
     while (true) {
         // Thread 0 grabs next tile, broadcasts via shared memory
@@ -322,9 +319,8 @@ void dispatch_ag_gemm(ag_globals g) {
 
     int total_blocks = max_blocks_per_cu * num_cus;
 
-    // Clamp to something reasonable — don't over-subscribe
-    // Need at least num_output_tiles blocks' worth of work, but persistent blocks loop
-    if (total_blocks > 1920) total_blocks = 1920;  // no more than output tiles
+    // DEBUG: force small grid to test persistent logic
+    total_blocks = 64;  // well under 256 CUs
 
     // Print debug info (remove later)
     static bool printed = false;
