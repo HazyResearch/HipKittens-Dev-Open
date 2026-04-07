@@ -1,4 +1,4 @@
-"""Benchmark: persistent AG-GEMM kernel vs torch.distributed.all_gather + torch.matmul"""
+"""Benchmark: AG-GEMM phases (copy vs GEMM) and comparison vs torch"""
 import torch
 import ctypes
 import time
@@ -58,14 +58,11 @@ configs = [
 ]
 
 if rank == 0:
-    print("="*80)
-    print(f"Persistent AG-GEMM Benchmark: all-blocks-copy-then-compute vs torch AG+matmul")
+    print("="*90)
+    print(f"AG-GEMM Phase Breakdown + Comparison")
     print(f"Device: {torch.cuda.get_device_name()}, World size: {world_size}")
     print(f"Warmup: {WARMUP}, Measured: {ITERS}")
-    print("="*80)
-    print(f"{'M':>6s} x {'K':>5s} x {'N':>5s}  {'K_local':>7s}  "
-          f"{'TK (ms)':>9s}  {'Torch (ms)':>10s}  {'Speedup':>7s}  {'TK TFLOPS':>10s}  {'Torch TFLOPS':>13s}")
-    print("-"*80)
+    print("="*90)
 
 scale = 10.0
 
@@ -98,6 +95,52 @@ for M, K, N in configs:
     counters_ptr = counters.data_ptr()
     work_ptr = work_counter.data_ptr()
 
+    # ── Time copy only ──
+    for _ in range(WARMUP):
+        tk_kernel.dispatch_copy_only(A_shard_iris, A_local, B_iris, C_iris,
+                                     iris_device_ctx, M, N, K, K_local, world_size,
+                                     counters_ptr, work_ptr, num_output_tiles)
+    torch.cuda.synchronize()
+    iris.barrier()
+
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(ITERS):
+        tk_kernel.dispatch_copy_only(A_shard_iris, A_local, B_iris, C_iris,
+                                     iris_device_ctx, M, N, K, K_local, world_size,
+                                     counters_ptr, work_ptr, num_output_tiles)
+    e.record()
+    torch.cuda.synchronize()
+    iris.barrier()
+    copy_ms = s.elapsed_time(e) / ITERS
+
+    # ── Time GEMM only (data already staged) ──
+    # Stage data once
+    tk_kernel.dispatch_copy_only(A_shard_iris, A_local, B_iris, C_iris,
+                                 iris_device_ctx, M, N, K, K_local, world_size,
+                                 counters_ptr, work_ptr, num_output_tiles)
+    torch.cuda.synchronize()
+    iris.barrier()
+
+    for _ in range(WARMUP):
+        tk_kernel.dispatch_gemm_only(A_shard_iris, A_local, B_iris, C_iris,
+                                     iris_device_ctx, M, N, K, K_local, world_size,
+                                     counters_ptr, work_ptr, num_output_tiles)
+    torch.cuda.synchronize()
+
+    s2 = torch.cuda.Event(enable_timing=True)
+    e2 = torch.cuda.Event(enable_timing=True)
+    s2.record()
+    for _ in range(ITERS):
+        tk_kernel.dispatch_gemm_only(A_shard_iris, A_local, B_iris, C_iris,
+                                     iris_device_ctx, M, N, K, K_local, world_size,
+                                     counters_ptr, work_ptr, num_output_tiles)
+    e2.record()
+    torch.cuda.synchronize()
+    gemm_ms = s2.elapsed_time(e2) / ITERS
+
+    # ── Time full (copy + GEMM) ──
     for _ in range(WARMUP):
         tk_kernel.dispatch_ag_gemm(A_shard_iris, A_local, B_iris, C_iris,
                                    iris_device_ctx, M, N, K, K_local, world_size,
@@ -105,19 +148,19 @@ for M, K, N in configs:
     torch.cuda.synchronize()
     iris.barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    s3 = torch.cuda.Event(enable_timing=True)
+    e3 = torch.cuda.Event(enable_timing=True)
+    s3.record()
     for _ in range(ITERS):
         tk_kernel.dispatch_ag_gemm(A_shard_iris, A_local, B_iris, C_iris,
                                    iris_device_ctx, M, N, K, K_local, world_size,
                                    counters_ptr, work_ptr, num_output_tiles)
-    end.record()
+    e3.record()
     torch.cuda.synchronize()
     iris.barrier()
-    tk_ms = start.elapsed_time(end) / ITERS
+    full_ms = s3.elapsed_time(e3) / ITERS
 
-    # Baseline: torch.distributed.all_gather + matmul
+    # ── Torch baseline: AG + matmul ──
     A_shards_list = [torch.empty_like(A_shard_torch) for _ in range(world_size)]
 
     for _ in range(WARMUP):
@@ -127,35 +170,66 @@ for M, K, N in configs:
     torch.cuda.synchronize()
     dist.barrier()
 
-    start2 = torch.cuda.Event(enable_timing=True)
-    end2 = torch.cuda.Event(enable_timing=True)
-    start2.record()
+    s4 = torch.cuda.Event(enable_timing=True)
+    e4 = torch.cuda.Event(enable_timing=True)
+    s4.record()
     for _ in range(ITERS):
         dist.all_gather(A_shards_list, A_shard_torch)
         A_full_torch = torch.cat(A_shards_list, dim=1)
         C_torch = torch.matmul(A_full_torch, B_torch.t())
-    end2.record()
+    e4.record()
     torch.cuda.synchronize()
     dist.barrier()
-    torch_ms = start2.elapsed_time(end2) / ITERS
+    torch_ms = s4.elapsed_time(e4) / ITERS
 
-    speedup = torch_ms / tk_ms
-    tk_tflops = flops / (tk_ms * 1e-3) / 1e12
+    # ── Torch matmul only (no AG) — how fast is rocBLAS on full K? ──
+    A_full_local = torch.randn(M, K, dtype=torch.bfloat16, device='cuda') / scale
+    for _ in range(WARMUP):
+        C_torch = torch.matmul(A_full_local, B_torch.t())
+    torch.cuda.synchronize()
+
+    s5 = torch.cuda.Event(enable_timing=True)
+    e5 = torch.cuda.Event(enable_timing=True)
+    s5.record()
+    for _ in range(ITERS):
+        C_torch = torch.matmul(A_full_local, B_torch.t())
+    e5.record()
+    torch.cuda.synchronize()
+    rocblas_ms = s5.elapsed_time(e5) / ITERS
+
+    gemm_tflops = flops / (gemm_ms * 1e-3) / 1e12
+    full_tflops = flops / (full_ms * 1e-3) / 1e12
     torch_tflops = flops / (torch_ms * 1e-3) / 1e12
+    rocblas_tflops = flops / (rocblas_ms * 1e-3) / 1e12
+    copy_bytes = world_size * M * K_local * 2  # bf16 = 2 bytes
+    copy_bw = copy_bytes / (copy_ms * 1e-3) / 1e9  # GB/s
 
     if rank == 0:
-        print(f"{M:6d} x {K:5d} x {N:5d}  {K_local:7d}  "
-              f"{tk_ms:9.3f}  {torch_ms:10.3f}  {speedup:6.2f}x  {tk_tflops:10.2f}  {torch_tflops:13.2f}")
+        print(f"\n  Shape: {M} x {K} x {N}  (K_local={K_local})")
+        print(f"  Copy bytes: {copy_bytes / 1e6:.1f} MB ({world_size} shards × {M}×{K_local}×2)")
+        print()
+        print(f"  {'Phase':<25s}  {'Time (ms)':>10s}  {'TFLOPS':>8s}  {'BW (GB/s)':>10s}")
+        print(f"  {'-'*60}")
+        print(f"  {'Copy (iris XGMI)':<25s}  {copy_ms:10.3f}  {'':>8s}  {copy_bw:10.1f}")
+        print(f"  {'GEMM only (TK)':<25s}  {gemm_ms:10.3f}  {gemm_tflops:8.1f}  {'':>10s}")
+        print(f"  {'Full (copy+GEMM)':<25s}  {full_ms:10.3f}  {full_tflops:8.1f}  {'':>10s}")
+        print(f"  {'-'*60}")
+        print(f"  {'torch AG+matmul':<25s}  {torch_ms:10.3f}  {torch_tflops:8.1f}  {'':>10s}")
+        print(f"  {'rocBLAS matmul only':<25s}  {rocblas_ms:10.3f}  {rocblas_tflops:8.1f}  {'':>10s}")
+        print()
+        print(f"  GEMM efficiency: TK={gemm_tflops:.0f} vs rocBLAS={rocblas_tflops:.0f} TFLOPS "
+              f"({gemm_tflops/rocblas_tflops*100:.0f}%)")
+        print(f"  Comm overhead: {copy_ms:.3f}ms ({copy_ms/full_ms*100:.0f}% of full)")
 
     del A_shard_iris, A_local, counters, work_counter, B_iris, C_iris, iris_device_ctx
-    del A_shard_torch, B_torch, C_torch, A_shards_list
+    del A_shard_torch, B_torch, C_torch, A_shards_list, A_full_local
     import gc; gc.collect()
     torch.cuda.synchronize()
     iris.barrier()
     dist.barrier()
 
 if rank == 0:
-    print("="*80)
+    print("="*90)
 
 dist.destroy_process_group()
 iris.barrier()

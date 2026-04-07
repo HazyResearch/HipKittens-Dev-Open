@@ -289,21 +289,45 @@ void dispatch_ag_gemm(ag_globals g) {
     }
 }
 
+// Copy only — for timing the copy phase in isolation
+void dispatch_copy_only(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int device_id;
+    hipGetDevice(&device_id);
+    hipDeviceProp_t props;
+    hipGetDeviceProperties(&props, device_id);
+    int copy_blocks = props.multiProcessorCount;
+    ag_copy_kernel<<<copy_blocks, COPY_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size);
+}
+
+// GEMM only — assumes data already in a_local
+void dispatch_gemm_only(ag_globals g) {
+    const unsigned long mem_size = g.dynamic_shared_memory();
+    hipFuncSetAttribute((void*)ag_gemm_kernel,
+                        hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    ag_gemm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+}
+
+#define BIND_AG_GLOBALS \
+    &ag_globals::a_shard, \
+    &ag_globals::a_local, \
+    &ag_globals::b, \
+    &ag_globals::c, \
+    &ag_globals::iris_ctx, \
+    &ag_globals::M, \
+    &ag_globals::N, \
+    &ag_globals::K, \
+    &ag_globals::K_local, \
+    &ag_globals::world_size, \
+    &ag_globals::counters_ptr, \
+    &ag_globals::work_counter_ptr, \
+    &ag_globals::num_output_tiles
+
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "tk_kernel python module — two-kernel all-gather GEMM";
-    py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
-        &ag_globals::a_shard,
-        &ag_globals::a_local,
-        &ag_globals::b,
-        &ag_globals::c,
-        &ag_globals::iris_ctx,
-        &ag_globals::M,
-        &ag_globals::N,
-        &ag_globals::K,
-        &ag_globals::K_local,
-        &ag_globals::world_size,
-        &ag_globals::counters_ptr,
-        &ag_globals::work_counter_ptr,
-        &ag_globals::num_output_tiles
-    );
+    py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_copy_only>(m, "dispatch_copy_only", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_gemm_only>(m, "dispatch_gemm_only", BIND_AG_GLOBALS);
 }
