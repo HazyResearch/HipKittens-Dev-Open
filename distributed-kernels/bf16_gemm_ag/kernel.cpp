@@ -45,7 +45,7 @@ struct ag_globals {
 
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
 
-    int num_gemm_blocks() {
+    __host__ __device__ int num_gemm_blocks() {
         return ceil_div(N, NEW_COL_BLOCK_SIZE) * ceil_div(M, NEW_ROW_BLOCK_SIZE);
     }
     dim3 grid()  { return dim3(num_prefetch_blocks + num_gemm_blocks()); }
