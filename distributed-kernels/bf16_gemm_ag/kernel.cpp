@@ -22,10 +22,14 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// Fused All-Gather GEMM with row-block-level signaling
-// Prefetchers copy A row-block by row-block and signal per (rank, row_block).
-// GEMM blocks only spin on their own row_block — start computing as soon as
-// their 128 rows are ready, even while other row_blocks are still in flight.
+// Fused All-Gather GEMM with chunk-level signaling
+// Row blocks are grouped into chunks. Prefetchers signal per (rank, chunk).
+// GEMM blocks spin on their chunk — start computing once their chunk is ready,
+// even while other chunks are still in flight.
+
+// Number of row-blocks per chunk. Tune for fence overhead vs overlap.
+// 60 row blocks / ROWS_PER_CHUNK = num_chunks signals per rank.
+#define ROWS_PER_CHUNK 8  // 8 row-blocks per chunk → ~8 chunks for M=7680
 
 struct ag_globals {
     gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
@@ -40,12 +44,13 @@ struct ag_globals {
     int K_local;
     int world_size;
     int num_prefetch_blocks;
-    uintptr_t counters_ptr;   // int[world_size * num_row_blocks]
+    uintptr_t counters_ptr;   // int[world_size * num_chunks]
 
     hipStream_t stream;
 
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
     __host__ __device__ int num_row_blocks() { return ceil_div(M, NEW_ROW_BLOCK_SIZE); }
+    __host__ __device__ int num_chunks() { return ceil_div(num_row_blocks(), ROWS_PER_CHUNK); }
 
     __host__ __device__ int num_gemm_blocks() {
         return ceil_div(N, NEW_COL_BLOCK_SIZE) * ceil_div(M, NEW_ROW_BLOCK_SIZE);
@@ -81,10 +86,10 @@ void ag_gemm_fused(ag_globals g) {
         uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
         int shard_elements = g.M * g.K_local;
         int num_rb = g.num_row_blocks();
+        int n_chunks = g.num_chunks();
 
-        // Row-block dimensions
-        int rb_rows = NEW_ROW_BLOCK_SIZE;  // 128 rows per row-block
-        int rb_elements = rb_rows * g.K_local;  // elements per row-block
+        // Chunk = ROWS_PER_CHUNK row-blocks worth of rows
+        int chunk_rows = ROWS_PER_CHUNK * NEW_ROW_BLOCK_SIZE;
 
         int global_tid = prefetch_id * PREFETCH_THREADS + threadIdx.x;
         int global_stride = g.num_prefetch_blocks * PREFETCH_THREADS;
@@ -96,12 +101,11 @@ void ag_gemm_fused(ag_globals g) {
                 (uintptr_t)g.a_shard.raw_ptr + delta);
             bf16* dst_base = g.a_local.raw_ptr + r * shard_elements;
 
-            for (int rb = 0; rb < num_rb; rb++) {
-                int row_start = rb * rb_rows;
-                int actual_rows = min(rb_rows, g.M - row_start);
+            for (int chunk = 0; chunk < n_chunks; chunk++) {
+                int row_start = chunk * chunk_rows;
+                int actual_rows = min(chunk_rows, g.M - row_start);
                 int actual_elements = actual_rows * g.K_local;
 
-                // Source and dest for this row-block
                 const int4* src4 = reinterpret_cast<const int4*>(remote_a + row_start * g.K_local);
                 int4* dst4 = reinterpret_cast<int4*>(dst_base + row_start * g.K_local);
                 int num_vec = actual_elements / 8;
@@ -113,7 +117,7 @@ void ag_gemm_fused(ag_globals g) {
                 __threadfence();
 
                 if (threadIdx.x == 0) {
-                    atomicAdd(&g.counters()[r * num_rb + rb], 1);
+                    atomicAdd(&g.counters()[r * n_chunks + chunk], 1);
                 }
             }
         }
@@ -159,7 +163,8 @@ void ag_gemm_fused(ag_globals g) {
 
     int K_local_tiles = g.K_local / BLOCK_SIZE;
     int shard_elements = g.M * g.K_local;
-    int num_rb = g.num_row_blocks();
+    int my_chunk = pid_m / ROWS_PER_CHUNK;  // which chunk this GEMM block belongs to
+    int n_chunks = g.num_chunks();
 
     auto a_gl = g.a_local;  // working copy — raw_ptr updated per rank
 
@@ -185,9 +190,9 @@ void ag_gemm_fused(ag_globals g) {
 
     // ── Process each rank ──
     for (int rank = 0; rank < g.world_size; rank++) {
-        // Spin only on THIS block's row_block for this rank
+        // Spin only on THIS block's chunk for this rank
         if (threadIdx.x == 0) {
-            spin_until_ready(&vol_counters[rank * num_rb + pid_m], g.num_prefetch_blocks);
+            spin_until_ready(&vol_counters[rank * n_chunks + my_chunk], g.num_prefetch_blocks);
         }
         __syncthreads();
 
@@ -307,8 +312,8 @@ void dispatch_ag_gemm(ag_globals g) {
     hipFuncSetAttribute((void*)ag_gemm_fused,
                         hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    // Zero counters: world_size * num_row_blocks
-    int num_counters = g.world_size * g.num_row_blocks();
+    // Zero counters: world_size * num_chunks
+    int num_counters = g.world_size * g.num_chunks();
     hipMemsetAsync(g.counters(), 0, num_counters * sizeof(int), g.stream);
 
     // Single fused launch
