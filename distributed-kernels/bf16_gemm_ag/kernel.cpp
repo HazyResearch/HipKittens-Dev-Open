@@ -20,16 +20,15 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// All-Gather GEMM with Pipelined Local Staging
-// Strategy: double-buffered staging with two streams
-//   Copy stream:   copy A_shard[r+1] from remote XGMI → staging[toc]
-//   Compute stream: GEMM C += staging[tic] @ B[:, r*K_local:(r+1)*K_local]^T
+// All-Gather GEMM with Local Staging Buffer
+// Strategy: for each source rank r:
+//   1. Bulk copy A_shard[r] from remote XGMI → local staging buffer (HBM)
+//   2. GEMM: C += staging_A @ B[:, r*K_local:(r+1)*K_local]^T (all local HBM reads)
 struct ag_globals {
-    gl<bf16, -1, -1, -1, -1> a_shard;    // [M, K_local] on iris heap
-    gl<bf16, -1, -1, -1, -1> a_staging;  // [M, K_local] local staging buffer 0
-    gl<bf16, -1, -1, -1, -1> a_staging2; // [M, K_local] local staging buffer 1
-    gl<bf16, -1, -1, -1, -1> b;          // [N, K] local
-    gl<bf16, -1, -1, -1, -1> c;          // [M, N] local output
+    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
+    gl<bf16, -1, -1, -1, -1> a_staging; // [M, K_local] local HBM staging buffer
+    gl<bf16, -1, -1, -1, -1> b;         // [N, K] local
+    gl<bf16, -1, -1, -1, -1> c;         // [M, N] local output
     iris::iris_device_view iris_ctx;
 
     int M;
@@ -249,79 +248,28 @@ void dispatch_ag_gemm(ag_globals g) {
     int copy_blocks = 256;
     int copy_threads = 256;
 
-    // Two-stream pipelining: overlap XGMI copy with GEMM compute
-    hipStream_t copy_stream;
-    hipStreamCreate(&copy_stream);
-
-    hipEvent_t copy_done[2], compute_done[2];
-    for (int i = 0; i < 2; i++) {
-        hipEventCreate(&copy_done[i]);
-        hipEventCreate(&compute_done[i]);
-    }
-
-    // Double-buffered staging pointers
-    bf16* staging[2] = {g.a_staging.raw_ptr, g.a_staging2.raw_ptr};
-
-    // Prime pipeline: copy rank 0 → staging[0]
-    {
-        uintptr_t base0 = g.iris_ctx.get_heap_base(0);
-        intptr_t delta = (intptr_t)base0 - (intptr_t)local_base;
-        bf16* remote_a0 = reinterpret_cast<bf16*>(
-            (uintptr_t)g.a_shard.raw_ptr + delta);
-        copy_a_to_staging<<<copy_blocks, copy_threads, 0, copy_stream>>>(
-            staging[0], remote_a0, num_elements);
-        hipEventRecord(copy_done[0], copy_stream);
-    }
-
-    int tic = 0;
     for (int r = 0; r < g.world_size; r++) {
-        int toc = 1 - tic;
+        // Compute remote A pointer for rank r
+        uintptr_t base_r = g.iris_ctx.get_heap_base(r);
+        intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
+        bf16* remote_a = reinterpret_cast<bf16*>(
+            (uintptr_t)g.a_shard.raw_ptr + delta);
 
-        // Start copy of rank r+1 into staging[toc] (if not last)
-        if (r + 1 < g.world_size) {
-            // Wait for compute to finish using staging[toc] before overwriting
-            if (r > 0) {
-                hipStreamWaitEvent(copy_stream, compute_done[toc], 0);
-            }
-            uintptr_t base_next = g.iris_ctx.get_heap_base(r + 1);
-            intptr_t delta = (intptr_t)base_next - (intptr_t)local_base;
-            bf16* remote_a_next = reinterpret_cast<bf16*>(
-                (uintptr_t)g.a_shard.raw_ptr + delta);
-            copy_a_to_staging<<<copy_blocks, copy_threads, 0, copy_stream>>>(
-                staging[toc], remote_a_next, num_elements);
-            hipEventRecord(copy_done[toc], copy_stream);
-        }
+        // Phase 1: bulk copy remote A → local staging
+        // Use hipMemcpyAsync for DMA engine transfer (separate from CUs)
+        hipMemcpyAsync(g.a_staging.raw_ptr, remote_a, shard_bytes,
+                       hipMemcpyDeviceToDevice, g.stream);
 
-        // Wait for copy of rank r to finish before computing
-        hipStreamWaitEvent(g.stream, copy_done[tic], 0);
-
-        // Swap staging pointer in globals for this rank's GEMM
-        ag_globals g_rank = g;
-        g_rank.a_staging.raw_ptr = staging[tic];
-
-        // GEMM: C += staging[tic] @ B_slice^T
-        ag_gemm_staged<<<g_rank.grid(), g_rank.block(), mem_size, g.stream>>>(
-            g_rank, r);
-        hipEventRecord(compute_done[tic], g.stream);
-
-        tic = toc;
-    }
-
-    // Sync and cleanup
-    hipStreamSynchronize(copy_stream);
-    hipStreamDestroy(copy_stream);
-    for (int i = 0; i < 2; i++) {
-        hipEventDestroy(copy_done[i]);
-        hipEventDestroy(compute_done[i]);
+        // Phase 2: GEMM with all-local reads
+        ag_gemm_staged<<<g.grid(), g.block(), mem_size, g.stream>>>(g, r);
     }
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — all-gather GEMM with pipelined staging";
+    m.doc() = "tk_kernel python module — all-gather GEMM with local staging";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
         &ag_globals::a_staging,
-        &ag_globals::a_staging2,
         &ag_globals::b,
         &ag_globals::c,
         &ag_globals::iris_ctx,

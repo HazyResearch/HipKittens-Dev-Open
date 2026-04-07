@@ -64,9 +64,8 @@ if rank == 0:
     print("\n[Allocating Tensors]")
 A_shard = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
 
-# Double-buffered staging: local HBM (not on iris heap), same shape as A_shard
+# Staging buffer: local HBM (not on iris heap), same shape as A_shard
 A_staging = torch.empty(M, K_local, dtype=torch.bfloat16, device='cuda')
-A_staging2 = torch.empty(M, K_local, dtype=torch.bfloat16, device='cuda')
 
 # B and C are local — regular CUDA memory
 B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
@@ -74,7 +73,7 @@ C = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
 if rank == 0:
     print(f"  A_shard: {A_shard.shape} (iris heap)")
-    print(f"  A_staging: {A_staging.shape} x2 (double-buffered local HBM)")
+    print(f"  A_staging: {A_staging.shape} (local HBM staging)")
     print(f"  B: {B.shape} (local), C: {C.shape} (local)")
 
 # Verify iris backing for A_shard
@@ -107,7 +106,7 @@ if rank == 0:
 iris_device_ctx = iris.get_device_view()
 iris.barrier()
 
-tk_kernel.dispatch_ag_gemm(A_shard, A_staging, A_staging2, B, C, iris_device_ctx,
+tk_kernel.dispatch_ag_gemm(A_shard, A_staging, B, C, iris_device_ctx,
                            M, N, K, K_local, world_size)
 torch.cuda.synchronize()
 iris.barrier()
@@ -129,7 +128,7 @@ if rank == 0:
 # Cleanup
 import gc
 from mpi4py import MPI
-del A_shard, A_staging, A_staging2, B, C, A_full, C_ref, A_full_list
+del A_shard, A_staging, B, C, A_full, C_ref, A_full_list
 gc.collect()
 torch.cuda.synchronize()
 iris.barrier()
