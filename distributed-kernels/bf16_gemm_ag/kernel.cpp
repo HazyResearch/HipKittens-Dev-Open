@@ -823,17 +823,22 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 
 #define PUSH_RING_THREADS 1024
 
+// Counter write: release store with system scope
+// On fine-grained memory this is visible across XGMI
 __device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
     __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+// Counter read: acquire load with system scope
 __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
     return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Fence: ensure all prior stores are visible system-wide before signaling
+// Data fence: drain write buffer so data is visible before counter
+// Using s_waitcnt vmcnt(0) — lighter than __threadfence_system()
+// On fine-grained memory, draining the write buffer = system visibility
 __device__ __forceinline__ void fence_stores() {
-    __threadfence_system();
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
@@ -937,7 +942,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 1;  // Start with 1 to test correctness
+    int num_channels = 32;
 
     static bool printed = false;
     if (!printed) {
