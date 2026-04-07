@@ -22,14 +22,10 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// Fused All-Gather GEMM with chunk-level signaling
-// Row blocks are grouped into chunks. Prefetchers signal per (rank, chunk).
-// GEMM blocks spin on their chunk — start computing once their chunk is ready,
-// even while other chunks are still in flight.
-
-// Number of row-blocks per chunk. Tune for fence overhead vs overlap.
-// 60 row blocks / ROWS_PER_CHUNK = num_chunks signals per rank.
-#define ROWS_PER_CHUNK 8  // 8 row-blocks per chunk → ~8 chunks for M=7680
+// Fused All-Gather GEMM with per-rank signaling
+// Prefetcher blocks copy entire A shard per rank, signal once per rank.
+// GEMM blocks spin on their rank's counter, compute from local memory.
+// Single kernel launch, accumulators in registers across all ranks.
 
 struct ag_globals {
     gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
@@ -44,13 +40,11 @@ struct ag_globals {
     int K_local;
     int world_size;
     int num_prefetch_blocks;
-    uintptr_t counters_ptr;   // int[world_size * num_chunks]
+    uintptr_t counters_ptr;   // int[world_size] counters
 
     hipStream_t stream;
 
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
-    __host__ __device__ int num_row_blocks() { return ceil_div(M, NEW_ROW_BLOCK_SIZE); }
-    __host__ __device__ int num_chunks() { return ceil_div(num_row_blocks(), ROWS_PER_CHUNK); }
 
     __host__ __device__ int num_gemm_blocks() {
         return ceil_div(N, NEW_COL_BLOCK_SIZE) * ceil_div(M, NEW_ROW_BLOCK_SIZE);
@@ -65,11 +59,11 @@ __device__ __forceinline__ void spin_until_ready(volatile int* counter, int targ
     while (*counter < target) {
         // spin — volatile ensures re-read
     }
-    __threadfence();  // ensure subsequent reads see data written before the counter
+    __threadfence();
 }
 
 // ============================================================================
-// Fused kernel: prefetcher + GEMM blocks, row-block-level signaling
+// Fused kernel: prefetcher + GEMM blocks
 // ============================================================================
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void ag_gemm_fused(ag_globals g) {
@@ -85,11 +79,6 @@ void ag_gemm_fused(ag_globals g) {
         int cur_rank = g.iris_ctx.cur_rank();
         uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
         int shard_elements = g.M * g.K_local;
-        int num_rb = g.num_row_blocks();
-        int n_chunks = g.num_chunks();
-
-        // Chunk = ROWS_PER_CHUNK row-blocks worth of rows
-        int chunk_rows = ROWS_PER_CHUNK * NEW_ROW_BLOCK_SIZE;
 
         int global_tid = prefetch_id * PREFETCH_THREADS + threadIdx.x;
         int global_stride = g.num_prefetch_blocks * PREFETCH_THREADS;
@@ -99,26 +88,20 @@ void ag_gemm_fused(ag_globals g) {
             intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
             const bf16* remote_a = reinterpret_cast<const bf16*>(
                 (uintptr_t)g.a_shard.raw_ptr + delta);
-            bf16* dst_base = g.a_local.raw_ptr + r * shard_elements;
+            bf16* dst = g.a_local.raw_ptr + r * shard_elements;
 
-            for (int chunk = 0; chunk < n_chunks; chunk++) {
-                int row_start = chunk * chunk_rows;
-                int actual_rows = min(chunk_rows, g.M - row_start);
-                int actual_elements = actual_rows * g.K_local;
+            const int4* src4 = reinterpret_cast<const int4*>(remote_a);
+            int4* dst4 = reinterpret_cast<int4*>(dst);
+            int num_vec = shard_elements / 8;
 
-                const int4* src4 = reinterpret_cast<const int4*>(remote_a + row_start * g.K_local);
-                int4* dst4 = reinterpret_cast<int4*>(dst_base + row_start * g.K_local);
-                int num_vec = actual_elements / 8;
+            for (int i = global_tid; i < num_vec; i += global_stride) {
+                dst4[i] = src4[i];
+            }
 
-                for (int i = global_tid; i < num_vec; i += global_stride) {
-                    dst4[i] = src4[i];
-                }
+            __threadfence();
 
-                __threadfence();
-
-                if (threadIdx.x == 0) {
-                    atomicAdd(&g.counters()[r * n_chunks + chunk], 1);
-                }
+            if (threadIdx.x == 0) {
+                atomicAdd(&g.counters()[r], 1);
             }
         }
         return;
@@ -163,8 +146,6 @@ void ag_gemm_fused(ag_globals g) {
 
     int K_local_tiles = g.K_local / BLOCK_SIZE;
     int shard_elements = g.M * g.K_local;
-    int my_chunk = pid_m / ROWS_PER_CHUNK;  // which chunk this GEMM block belongs to
-    int n_chunks = g.num_chunks();
 
     auto a_gl = g.a_local;  // working copy — raw_ptr updated per rank
 
@@ -190,9 +171,9 @@ void ag_gemm_fused(ag_globals g) {
 
     // ── Process each rank ──
     for (int rank = 0; rank < g.world_size; rank++) {
-        // Spin only on THIS block's chunk for this rank
+        // Spin until prefetchers have finished this rank
         if (threadIdx.x == 0) {
-            spin_until_ready(&vol_counters[rank * n_chunks + my_chunk], g.num_prefetch_blocks);
+            spin_until_ready(&vol_counters[rank], g.num_prefetch_blocks);
         }
         __syncthreads();
 
@@ -312,16 +293,15 @@ void dispatch_ag_gemm(ag_globals g) {
     hipFuncSetAttribute((void*)ag_gemm_fused,
                         hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    // Zero counters: world_size * num_chunks
-    int num_counters = g.world_size * g.num_chunks();
-    hipMemsetAsync(g.counters(), 0, num_counters * sizeof(int), g.stream);
+    // Zero counters
+    hipMemsetAsync(g.counters(), 0, g.world_size * sizeof(int), g.stream);
 
     // Single fused launch
     ag_gemm_fused<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — fused all-gather GEMM with row-block signaling";
+    m.doc() = "tk_kernel python module — fused all-gather GEMM";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
         &ag_globals::a_local,

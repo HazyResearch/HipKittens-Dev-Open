@@ -81,10 +81,7 @@ for M, K, N in configs:
     # ── Allocate iris tensors ──
     A_shard_iris = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
     A_local = torch.empty(world_size * M, K_local, dtype=torch.bfloat16, device='cuda')
-    ROWS_PER_CHUNK = 8
-    num_row_blocks = M // 128
-    num_chunks = (num_row_blocks + ROWS_PER_CHUNK - 1) // ROWS_PER_CHUNK
-    counters = torch.zeros(world_size * num_chunks, dtype=torch.int32, device='cuda')
+    counters = torch.zeros(world_size, dtype=torch.int32, device='cuda')
     B_iris = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
     C_iris = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
