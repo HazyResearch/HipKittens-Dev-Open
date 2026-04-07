@@ -518,6 +518,275 @@ void dispatch_fused_ag_gemm(ag_globals g) {
     ag_fused_gemm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
+// ============================================================================
+// Pipelined AG-GEMM: copy rank r on stream_copy, GEMM rank r on stream_gemm
+// Events synchronize: GEMM for rank r waits for copy of rank r to complete
+// Copy of rank r+1 runs concurrently with GEMM of rank r
+// ============================================================================
+
+// Copy kernel for a SINGLE rank (one step of the ring)
+__global__ __launch_bounds__(COPY_THREADS, 1)
+void ag_copy_one_rank_kernel(const bf16* __restrict__ a_shard_ptr,
+                              bf16* __restrict__ a_local_ptr,
+                              intptr_t delta,
+                              int shard_elements, int dst_rank) {
+    int global_tid = blockIdx.x * COPY_THREADS + threadIdx.x;
+    int global_stride = gridDim.x * COPY_THREADS;
+
+    const int4* src4 = reinterpret_cast<const int4*>(
+        (uintptr_t)a_shard_ptr + delta);
+    int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + dst_rank * shard_elements);
+    int num_vec = shard_elements / 8;
+
+    for (int i = global_tid; i < num_vec; i += global_stride) {
+        dst4[i] = src4[i];
+    }
+}
+
+// GEMM kernel for a SINGLE rank's K-slice (accumulates into C)
+// rank_step: which rank we're processing (0 = first, zero accumulators)
+// src_rank: which rank's data in a_local to read from
+__global__ __launch_bounds__(NUM_THREADS, 2)
+void ag_gemm_one_rank_kernel(ag_globals g, int src_rank, int rank_step) {
+
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+
+    using ST_A = st_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>;
+    using ST_B = st_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>;
+    ST_A (&As)[2][M_BLOCK][2] = al.allocate<ST_A, 2, M_BLOCK, 2>();
+    ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
+
+    int warp_id = kittens::warpid();
+    int local_warp_id = warp_id % 4;
+    int warp_group_id = warp_id / 4;
+    bool is_producer = (warp_group_id == 0);
+    bool is_consumer = (warp_group_id > 0 && warp_group_id <= M_BLOCK);
+    int consumer_idx = is_consumer ? warp_group_id - 1 : 0;
+
+    int K_local_tiles = g.K_local / BLOCK_SIZE;
+    int shard_elements = g.M * g.K_local;
+
+    // Point to this rank's section in a_local
+    auto a_gl = g.a_local;
+    a_gl.raw_ptr = g.a_local.raw_ptr + src_rank * shard_elements;
+
+    // Map block → output tile with swizzle
+    const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
+    const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
+    const int WGM = 4;
+
+    int wgid = blockIdx.x;
+    const int NUM_WGS = g.num_output_tiles;
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
+    const int num_wgid_in_group = WGM * num_pid_n;
+    int group_id = wgid / num_wgid_in_group;
+    int first_pid_m = group_id * WGM;
+    int group_size_m = min(num_pid_m - first_pid_m, WGM);
+    int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
+    int pid_n = (wgid % num_wgid_in_group) / group_size_m;
+    int row = pid_m * M_BLOCK;
+    int col = pid_n * N_BLOCK;
+
+    using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>::dtype;
+    constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<T>();
+    constexpr int bytes_per_memcpy = bytes_per_thread * NUM_PRODUCER_THREADS;
+    constexpr int memcpy_per_tile = BLOCK_SIZE * BLOCK_SIZE * sizeof(T) / bytes_per_memcpy;
+    uint32_t swizzled_offsets_A[memcpy_per_tile];
+    uint32_t swizzled_offsets_B[memcpy_per_tile];
+    G::prefill_swizzled_offsets(As[0][0][0], a_gl, swizzled_offsets_A);
+    G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
+
+    // Accumulators: load from C if continuing, else zero
+    rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
+    if (is_consumer) {
+        if (rank_step == 0) {
+            zero(C_accum[0][0]);
+            zero(C_accum[0][1]);
+            zero(C_accum[1][0]);
+            zero(C_accum[1][1]);
+        } else {
+            // Load current C accumulation
+            load(C_accum[0][0], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
+            load(C_accum[0][1], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
+            load(C_accum[1][0], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
+            load(C_accum[1][1], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
+        }
+    }
+
+    int tic = 0, toc = 1;
+    int global_k0 = src_rank * K_local_tiles;
+
+    // Prefetch first tile
+    if (is_producer) {
+        #pragma unroll
+        for (int m = 0; m < M_BLOCK; m++) {
+            G::load<2, false>(As[0][m][0], a_gl, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[0][m][1], a_gl, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+        }
+        #pragma unroll
+        for (int n = 0; n < N_BLOCK; n++) {
+            G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, global_k0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, global_k0}, swizzled_offsets_B);
+        }
+        __builtin_amdgcn_s_waitcnt(0);
+    }
+    __syncthreads();
+
+    // K-tile loop for this single rank
+    for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
+        int next_local_k = tile + 1;
+        int next_global_k = src_rank * K_local_tiles + next_local_k;
+
+        if (is_producer) {
+            #pragma unroll
+            for (int m = 0; m < M_BLOCK; m++) {
+                G::load<2, false>(As[toc][m][0], a_gl, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
+                G::load<2, false>(As[toc][m][1], a_gl, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
+            }
+            #pragma unroll
+            for (int n = 0; n < N_BLOCK; n++) {
+                G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_global_k}, swizzled_offsets_B);
+                G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_global_k}, swizzled_offsets_B);
+            }
+            __builtin_amdgcn_s_waitcnt(0);
+        } else if (is_consumer) {
+            A_slice a0;
+            B_slice b0, b1;
+
+            auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+            load(b0, st_b);
+            auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+            load(b1, st_b);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+            mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+            __builtin_amdgcn_s_setprio(0);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+    }
+
+    // Last tile
+    if (is_consumer) {
+        A_slice a0;
+        B_slice b0, b1;
+
+        auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+        load(b0, st_b);
+        auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+        load(a0, st_a);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+        __builtin_amdgcn_s_setprio(0);
+
+        st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+        load(b1, st_b);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+        __builtin_amdgcn_s_setprio(0);
+
+        st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+        load(a0, st_a);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+        mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+        __builtin_amdgcn_s_setprio(0);
+    }
+
+    // Store C
+    if (is_consumer) {
+        store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
+        store(g.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
+    }
+}
+
+// Pipelined dispatch: overlap copy of rank r+1 with GEMM of rank r
+void dispatch_pipelined_ag_gemm(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int cur_rank = g.iris_ctx.cur_rank();
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+
+    int device_id;
+    hipGetDevice(&device_id);
+    hipDeviceProp_t props;
+    hipGetDeviceProperties(&props, device_id);
+    int copy_blocks = props.multiProcessorCount;
+
+    const unsigned long mem_size = g.dynamic_shared_memory();
+    hipFuncSetAttribute((void*)ag_gemm_one_rank_kernel,
+                        hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+
+    // Create two streams + events for pipelining
+    hipStream_t stream_copy, stream_gemm;
+    hipStreamCreate(&stream_copy);
+    hipStreamCreate(&stream_gemm);
+
+    hipEvent_t copy_done[8]; // max 8 ranks
+    for (int i = 0; i < g.world_size; i++) {
+        hipEventCreate(&copy_done[i]);
+    }
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[pipelined_ag_gemm] output_tiles=%d, %d ranks, 2-stream pipeline\n",
+                g.num_output_tiles, g.world_size);
+        printed = true;
+    }
+
+    for (int step = 0; step < g.world_size; step++) {
+        int src_rank = (cur_rank + step) % g.world_size;
+        uintptr_t src_base = g.iris_ctx.get_heap_base(src_rank);
+        intptr_t delta = (intptr_t)src_base - (intptr_t)local_base;
+
+        // Launch copy for this rank on stream_copy
+        ag_copy_one_rank_kernel<<<copy_blocks, COPY_THREADS, 0, stream_copy>>>(
+            g.a_shard.raw_ptr, g.a_local.raw_ptr, delta, shard_elements, src_rank);
+        hipEventRecord(copy_done[step], stream_copy);
+
+        // GEMM stream waits for this rank's copy to finish
+        hipStreamWaitEvent(stream_gemm, copy_done[step], 0);
+
+        // Launch GEMM for this rank on stream_gemm
+        ag_gemm_one_rank_kernel<<<g.grid(), g.block(), mem_size, stream_gemm>>>(
+            g, src_rank, step);
+    }
+
+    // Record completion on the original stream
+    hipEvent_t all_done;
+    hipEventCreate(&all_done);
+    hipEventRecord(all_done, stream_gemm);
+    hipStreamWaitEvent(g.stream, all_done, 0);
+
+    // Cleanup (deferred to avoid blocking)
+    hipEventDestroy(all_done);
+    for (int i = 0; i < g.world_size; i++) {
+        hipEventDestroy(copy_done[i]);
+    }
+    hipStreamDestroy(stream_copy);
+    hipStreamDestroy(stream_gemm);
+}
+
 #define BIND_AG_GLOBALS \
     &ag_globals::a_shard, \
     &ag_globals::a_local, \
@@ -539,4 +808,5 @@ PYBIND11_MODULE(tk_kernel, m) {
     py::bind_function<dispatch_copy_only>(m, "dispatch_copy_only", BIND_AG_GLOBALS);
     py::bind_function<dispatch_gemm_only>(m, "dispatch_gemm_only", BIND_AG_GLOBALS);
     py::bind_function<dispatch_fused_ag_gemm>(m, "dispatch_fused_ag_gemm", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_pipelined_ag_gemm>(m, "dispatch_pipelined_ag_gemm", BIND_AG_GLOBALS);
 }

@@ -144,10 +144,32 @@ mean_error = diff.mean().item()
 fused_status = "PASSED" if max_error < 0.5 else "FAILED"
 print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {fused_status}")
 
-overall = "PASSED" if staged_status == "PASSED" and fused_status == "PASSED" else "FAILED"
+# Run pipelined AG-GEMM (copy||GEMM overlap)
+if rank == 0:
+    print("\n[Running Pipelined AG-GEMM (copy||GEMM)]")
+C.zero_()
+iris.barrier()
+
+tk_kernel.dispatch_pipelined_ag_gemm(A_shard, A_local, B, C, iris_device_ctx,
+                                      M, N, K, K_local, world_size,
+                                      counters.data_ptr(), work_counter.data_ptr(),
+                                      num_output_tiles)
+torch.cuda.synchronize()
+iris.barrier()
+
+# Validate pipelined
+if rank == 0:
+    print("\n[Validating Pipelined Results]")
+diff = (C.float() - C_ref.float()).abs()
+max_error = diff.max().item()
+mean_error = diff.mean().item()
+pipelined_status = "PASSED" if max_error < 0.5 else "FAILED"
+print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {pipelined_status}")
+
+overall = "PASSED" if staged_status == "PASSED" and fused_status == "PASSED" and pipelined_status == "PASSED" else "FAILED"
 if rank == 0:
     print("\n" + "="*60)
-    print(f"Staged: {staged_status}, Fused: {fused_status}")
+    print(f"Staged: {staged_status}, Fused: {fused_status}, Pipelined: {pipelined_status}")
     print(f"Result: {overall}")
     print("="*60)
 

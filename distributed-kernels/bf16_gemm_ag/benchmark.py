@@ -108,6 +108,11 @@ for M, K, N in configs:
                                           iris_device_ctx, M, N, K, K_local, world_size,
                                           counters_ptr, work_ptr, num_output_tiles)
 
+    def call_pipelined():
+        tk_kernel.dispatch_pipelined_ag_gemm(A_shard_iris, A_local, B, C,
+                                              iris_device_ctx, M, N, K, K_local, world_size,
+                                              counters_ptr, work_ptr, num_output_tiles)
+
     def call_rccl_ag():
         dist.all_gather_into_tensor(A_local, A_shard_torch)
 
@@ -152,6 +157,7 @@ for M, K, N in configs:
     gemm_ms = time_fn(call_gemm_only, "gemm_only")
     full_iris_ms = time_fn(call_full, "iris_full")
     fused_iris_ms = time_fn(call_fused, "iris_fused")
+    pipelined_iris_ms = time_fn(call_pipelined, "iris_pipelined")
 
     # RCCL-based
     rccl_ag_ms = time_fn(call_rccl_ag, "rccl_ag")
@@ -195,13 +201,15 @@ for M, K, N in configs:
         print(f"  {'-'*58}")
         print(f"  {'Iris copy + TK GEMM (staged)':<35s}  {full_iris_ms:10.3f}  {flops/(full_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris fused AG-GEMM (ring)':<35s}  {fused_iris_ms:10.3f}  {flops/(fused_iris_ms*1e-3)/1e12:8.1f}")
+        print(f"  {'Iris pipelined (copy||GEMM)':<35s}  {pipelined_iris_ms:10.3f}  {flops/(pipelined_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'RCCL AG + TK GEMM':<35s}  {rccl_tk_ms:10.3f}  {flops/(rccl_tk_ms*1e-3)/1e12:8.1f}")
         print(f"  {'torch AG + rocBLAS (baseline)':<35s}  {torch_ms:10.3f}  {flops/(torch_ms*1e-3)/1e12:8.1f}")
         print(f"  {'-'*58}")
-        speedup_vs_torch = torch_ms / fused_iris_ms
-        print(f"\n  Fused iris vs torch: {speedup_vs_torch:.2f}x {'FASTER' if speedup_vs_torch > 1 else 'slower'}")
-        print(f"  Fused iris vs RCCL+TK: {rccl_tk_ms/fused_iris_ms:.2f}x {'faster' if fused_iris_ms < rccl_tk_ms else 'slower'}")
-        print(f"  Fused iris vs staged iris: {full_iris_ms/fused_iris_ms:.2f}x faster")
+        best_iris = min(fused_iris_ms, pipelined_iris_ms, full_iris_ms)
+        best_name = "fused" if best_iris == fused_iris_ms else ("pipelined" if best_iris == pipelined_iris_ms else "staged")
+        print(f"\n  Best iris ({best_name}) vs torch: {torch_ms/best_iris:.2f}x")
+        print(f"  Best iris ({best_name}) vs RCCL+TK: {rccl_tk_ms/best_iris:.2f}x")
+        print(f"  Pipelined vs staged: {full_iris_ms/pipelined_iris_ms:.2f}x")
 
     del A_shard_iris, A_local, counters, work_counter, B, C, iris_device_ctx
     del A_shard_torch, A_shards_list, A_full_local
