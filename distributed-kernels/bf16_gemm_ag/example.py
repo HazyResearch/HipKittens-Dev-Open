@@ -100,9 +100,9 @@ C_ref = torch.matmul(A_full, B.t())
 if rank == 0:
     print(f"  A_full: {A_full.shape}, C_ref: {C_ref.shape}")
 
-# Run persistent AG-GEMM
+# Run staged AG-GEMM (copy + GEMM)
 if rank == 0:
-    print("\n[Running Persistent AG-GEMM Kernel]")
+    print("\n[Running Staged AG-GEMM (copy + GEMM)]")
 iris_device_ctx = iris.get_device_view()
 iris.barrier()
 
@@ -113,18 +113,42 @@ tk_kernel.dispatch_ag_gemm(A_shard, A_local, B, C, iris_device_ctx,
 torch.cuda.synchronize()
 iris.barrier()
 
-# Validate
+# Validate staged
 if rank == 0:
-    print("\n[Validating Results]")
+    print("\n[Validating Staged Results]")
 diff = (C.float() - C_ref.float()).abs()
 max_error = diff.max().item()
 mean_error = diff.mean().item()
-status = "PASSED" if max_error < 0.5 else "FAILED"
-print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {status}")
+staged_status = "PASSED" if max_error < 0.5 else "FAILED"
+print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {staged_status}")
 
+# Run fused AG-GEMM (ring-ordered iris reads in GEMM producers)
+if rank == 0:
+    print("\n[Running Fused AG-GEMM (ring-ordered iris reads)]")
+C.zero_()
+iris.barrier()
+
+tk_kernel.dispatch_fused_ag_gemm(A_shard, A_local, B, C, iris_device_ctx,
+                                  M, N, K, K_local, world_size,
+                                  counters.data_ptr(), work_counter.data_ptr(),
+                                  num_output_tiles)
+torch.cuda.synchronize()
+iris.barrier()
+
+# Validate fused
+if rank == 0:
+    print("\n[Validating Fused Results]")
+diff = (C.float() - C_ref.float()).abs()
+max_error = diff.max().item()
+mean_error = diff.mean().item()
+fused_status = "PASSED" if max_error < 0.5 else "FAILED"
+print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {fused_status}")
+
+overall = "PASSED" if staged_status == "PASSED" and fused_status == "PASSED" else "FAILED"
 if rank == 0:
     print("\n" + "="*60)
-    print(f"Result: {status}")
+    print(f"Staged: {staged_status}, Fused: {fused_status}")
+    print(f"Result: {overall}")
     print("="*60)
 
 # Cleanup
