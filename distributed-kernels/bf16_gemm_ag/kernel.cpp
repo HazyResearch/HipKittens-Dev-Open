@@ -51,10 +51,9 @@ struct ag_globals {
     size_t dynamic_shared_memory() { return 98304 + 16; } // +16 for scratch
 };
 
-// Spin on a single counter until >= target
-__device__ __forceinline__ void spin_until_ready(volatile int* counter, int target) {
-    while (*counter < target) {}
-    __threadfence();
+// Spin on a single counter until >= target using atomic loads
+__device__ __forceinline__ void spin_until_ready(int* counter, int target) {
+    while (__hip_atomic_load(counter, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) {}
 }
 
 // ============================================================================
@@ -105,10 +104,9 @@ void ag_gemm_persistent(ag_globals g) {
                 dst4[i] = src4[i];
             }
 
-            __threadfence();
-
             if (threadIdx.x == 0) {
-                atomicAdd(&counters[r], 1);
+                __threadfence();
+                __hip_atomic_fetch_add(&counters[r], 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
             }
         }
     }
@@ -137,8 +135,6 @@ void ag_gemm_persistent(ag_globals g) {
     uint32_t swizzled_offsets_B[memcpy_per_tile];
     G::prefill_swizzled_offsets(As[0][0][0], a_gl, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
-
-    volatile int* vol_counters = counters;
 
     const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
     const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
@@ -184,7 +180,7 @@ void ag_gemm_persistent(ag_globals g) {
         for (int rank = 0; rank < g.world_size; rank++) {
             // Spin until this rank's data is fully copied
             if (threadIdx.x == 0) {
-                spin_until_ready(&vol_counters[rank], total_blocks);
+                spin_until_ready(&counters[rank], total_blocks);
             }
             __syncthreads();
 
