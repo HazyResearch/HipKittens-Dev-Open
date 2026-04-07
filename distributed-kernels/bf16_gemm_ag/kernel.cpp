@@ -954,55 +954,42 @@ void dispatch_push_ring_ag(ag_globals g) {
         sync_counters, num_channels);
 }
 
-// Host-side ring: separate kernel per step, stream ordering handles sync.
-// iris.barrier() between steps ensures cross-GPU visibility.
-// This isolates XGMI bandwidth from sync overhead.
-void dispatch_push_ring_host(ag_globals g) {
+// Per-step push ring dispatch. Call from Python with iris.barrier() between steps.
+// step: 0..world_size-2
+// Step 0: push own shard to local a_local + next rank's a_local
+// Step 1..W-3: forward shard from local a_local to next rank's a_local
+// Step W-2: no push needed (prev rank pushed directly into our a_local)
+void dispatch_push_ring_step(ag_globals g, int step) {
     int shard_elements = g.M * g.K_local;
-    int shard_bytes = shard_elements * sizeof(bf16);
     int cur_rank = g.iris_ctx.cur_rank();
     uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
     int next_rank = (cur_rank + 1) % g.world_size;
     intptr_t push_delta = (intptr_t)g.iris_ctx.get_heap_base(next_rank) - (intptr_t)local_base;
     bf16* next_a_local = (bf16*)((uintptr_t)g.a_local.raw_ptr + push_delta);
 
-    int device_id;
-    hipGetDevice(&device_id);
-    hipDeviceProp_t props;
-    hipGetDeviceProperties(&props, device_id);
-    int num_blocks = props.multiProcessorCount;
+    int num_blocks = 256;  // Use all CUs
 
-    static bool printed = false;
-    if (!printed) {
-        fprintf(stderr, "[push_ring_host] shard=%d, %d blocks, host-side ring\n",
-                shard_elements, num_blocks);
-        printed = true;
+    int src_rank = (cur_rank - step + g.world_size) % g.world_size;
+
+    if (step == 0) {
+        // Copy own shard to local a_local slot
+        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+            g.a_shard.raw_ptr,
+            g.a_local.raw_ptr + src_rank * shard_elements,
+            shard_elements);
+        // Push own shard to next rank's a_local slot
+        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+            g.a_shard.raw_ptr,
+            next_a_local + src_rank * shard_elements,
+            shard_elements);
+    } else if (step < g.world_size - 2) {
+        // Forward: read from local a_local (where prev rank pushed), push to next
+        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+            g.a_local.raw_ptr + src_rank * shard_elements,
+            next_a_local + src_rank * shard_elements,
+            shard_elements);
     }
-
-    for (int step = 0; step < g.world_size - 1; step++) {
-        int src_rank = (cur_rank - step + g.world_size) % g.world_size;
-
-        if (step == 0) {
-            // Copy own shard to local a_local
-            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
-                g.a_shard.raw_ptr,
-                g.a_local.raw_ptr + src_rank * shard_elements,
-                shard_elements);
-            // Push own shard to next rank's a_local
-            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
-                g.a_shard.raw_ptr,
-                next_a_local + src_rank * shard_elements,
-                shard_elements);
-        } else if (step < g.world_size - 2) {
-            // Forward: read from local a_local, push to next rank
-            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
-                g.a_local.raw_ptr + src_rank * shard_elements,
-                next_a_local + src_rank * shard_elements,
-                shard_elements);
-        }
-        // Last step: data already in a_local, nothing to push
-        // NOTE: caller must call iris.barrier() between steps for cross-GPU sync
-    }
+    // Last step (W-2): data already in our a_local from prev rank's push, no kernel needed
 }
 
 // Push ring AG + standard TK GEMM (sequential, for comparison with RCCL+TK)
@@ -1040,4 +1027,28 @@ PYBIND11_MODULE(tk_kernel, m) {
     py::bind_function<dispatch_copy_memcpy>(m, "dispatch_copy_memcpy", BIND_AG_GLOBALS);
     py::bind_function<dispatch_push_ring_ag>(m, "dispatch_push_ring_ag", BIND_AG_GLOBALS);
     py::bind_function<dispatch_push_ring_ag_gemm>(m, "dispatch_push_ring_ag_gemm", BIND_AG_GLOBALS);
+
+    // Host-side ring: per-step dispatch with iris.barrier() between steps
+    m.def("dispatch_push_ring_step", [](py::object<int> a_shard, py::object<int> a_local,
+                                         py::object<int> b, py::object<int> c,
+                                         py::object<int> iris_ctx_obj,
+                                         int M, int N, int K, int K_local,
+                                         int world_size, uintptr_t counters_ptr,
+                                         uintptr_t work_counter_ptr,
+                                         int num_output_tiles, int step) {
+        using gl_type = gl<bf16, -1, -1, -1, -1>;
+        ag_globals g;
+        g.a_shard = py::from_object<gl_type>::make(a_shard);
+        g.a_local = py::from_object<gl_type>::make(a_local);
+        g.b = py::from_object<gl_type>::make(b);
+        g.c = py::from_object<gl_type>::make(c);
+        g.iris_ctx = py::from_object<iris::iris_device_view>::make(iris_ctx_obj);
+        g.M = M; g.N = N; g.K = K; g.K_local = K_local;
+        g.world_size = world_size;
+        g.counters_ptr = counters_ptr;
+        g.work_counter_ptr = work_counter_ptr;
+        g.num_output_tiles = num_output_tiles;
+        g.stream = 0;
+        dispatch_push_ring_step(g, step);
+    });
 }

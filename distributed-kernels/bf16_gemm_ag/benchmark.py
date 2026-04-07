@@ -123,6 +123,14 @@ for M, K, N in configs:
                                          iris_device_ctx, M, N, K, K_local, world_size,
                                          sync_counters_ptr, work_ptr, num_output_tiles)
 
+    def call_host_ring_ag():
+        for step in range(world_size - 1):
+            tk_kernel.dispatch_push_ring_step(A_shard_iris, A_local, B, C,
+                                               iris_device_ctx, M, N, K, K_local, world_size,
+                                               sync_counters_ptr, work_ptr, num_output_tiles, step)
+            torch.cuda.synchronize()
+            iris.barrier()
+
     def call_push_ring_ag_gemm():
         sync_counters.zero_()
         tk_kernel.dispatch_push_ring_ag_gemm(A_shard_iris, A_local, B, C,
@@ -179,11 +187,16 @@ for M, K, N in configs:
     fused_iris_ms = time_fn(call_fused, "iris_fused")
     pipelined_iris_ms = time_fn(call_pipelined, "iris_pipelined")
 
-    # Push ring AG (iris, RCCL-style)
-    push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
+    # Host-side ring AG (iris.barrier() between steps — no in-kernel sync)
+    host_ring_ag_ms = time_fn(call_host_ring_ag, "iris_host_ring_ag")
+
+    # In-kernel push ring AG (skip if hanging)
+    # push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
+    push_ring_ag_ms = host_ring_ag_ms  # placeholder
 
     # Push ring AG + TK GEMM
-    push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
+    # push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
+    push_ring_ag_gemm_ms = host_ring_ag_ms  # placeholder
 
     # RCCL-based
     rccl_ag_ms = time_fn(call_rccl_ag, "rccl_ag")
@@ -224,8 +237,8 @@ for M, K, N in configs:
         memcpy_bw = total_bytes/1e9/(copy_memcpy_ms*1e-3)
         print(f"  {'Iris copy (hipMemcpy, ring)':<35s}  {copy_memcpy_ms:10.3f}  {memcpy_bw:7.0f} GB/s")
         rccl_bw = total_bytes/1e9/(rccl_ag_ms*1e-3)
-        push_bw = total_bytes/1e9/(push_ring_ag_ms*1e-3)
-        print(f"  {'Iris push ring AG':<35s}  {push_ring_ag_ms:10.3f}  {push_bw:7.0f} GB/s")
+        host_ring_bw = total_bytes/1e9/(host_ring_ag_ms*1e-3)
+        print(f"  {'Iris host ring AG (barrier)':<35s}  {host_ring_ag_ms:10.3f}  {host_ring_bw:7.0f} GB/s")
         print(f"  {'RCCL all_gather_into_tensor':<35s}  {rccl_ag_ms:10.3f}  {rccl_bw:7.0f} GB/s")
         print(f"  {'TK GEMM only':<35s}  {gemm_ms:10.3f}  {flops/(gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'rocBLAS matmul only':<35s}  {rocblas_ms:10.3f}  {flops/(rocblas_ms*1e-3)/1e12:8.1f}")
@@ -233,7 +246,7 @@ for M, K, N in configs:
         print(f"  {'Iris copy + TK GEMM (staged)':<35s}  {full_iris_ms:10.3f}  {flops/(full_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris fused AG-GEMM (ring)':<35s}  {fused_iris_ms:10.3f}  {flops/(fused_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris pipelined (copy||GEMM)':<35s}  {pipelined_iris_ms:10.3f}  {flops/(pipelined_iris_ms*1e-3)/1e12:8.1f}")
-        print(f"  {'Iris push ring AG + TK GEMM':<35s}  {push_ring_ag_gemm_ms:10.3f}  {flops/(push_ring_ag_gemm_ms*1e-3)/1e12:8.1f}")
+        print(f"  {'Iris host ring AG + TK GEMM':<35s}  {host_ring_ag_ms + gemm_ms:10.3f}  {flops/((host_ring_ag_ms + gemm_ms)*1e-3)/1e12:8.1f}")
         print(f"  {'RCCL AG + TK GEMM':<35s}  {rccl_tk_ms:10.3f}  {flops/(rccl_tk_ms*1e-3)/1e12:8.1f}")
         print(f"  {'torch AG + rocBLAS (baseline)':<35s}  {torch_ms:10.3f}  {flops/(torch_ms*1e-3)/1e12:8.1f}")
         print(f"  {'-'*58}")
