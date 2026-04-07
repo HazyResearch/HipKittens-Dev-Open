@@ -827,6 +827,7 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 // Broadcast push: each rank pushes its own shard to ALL other ranks' a_local.
 // Ring-ordered destinations so at each step all GPUs write to unique targets.
 // a_local MUST be on iris heap for cross-GPU pointer translation.
+// Best iris AG approach so far: 148 GB/s (vs RCCL 400 GB/s)
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
 void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
@@ -839,11 +840,10 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
     uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
 
     int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
-    int global_stride = num_blocks_total * PUSH_RING_THREADS;
+    int global_stride = gridDim.x * PUSH_RING_THREADS;
     int shard_bytes = shard_elements * sizeof(bf16);
     int num_vec = shard_bytes / sizeof(int4);
 
-    // Push own shard to ALL ranks' a_local (including self), ring-ordered
     for (int step = 0; step < world_size; step++) {
         int dst_rank = (cur_rank + step) % world_size;
 
