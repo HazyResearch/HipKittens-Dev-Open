@@ -8,25 +8,27 @@ constexpr int M_BLOCK = 2;
 constexpr int N_BLOCK = 4;
 constexpr int HALF_BLOCK_SIZE = BLOCK_SIZE / 2; // 32
 
-constexpr int NEW_ROW_BLOCK_SIZE = BLOCK_SIZE * M_BLOCK;
-constexpr int NEW_COL_BLOCK_SIZE = BLOCK_SIZE * N_BLOCK;
+constexpr int NEW_ROW_BLOCK_SIZE = BLOCK_SIZE * M_BLOCK;   // 128
+constexpr int NEW_COL_BLOCK_SIZE = BLOCK_SIZE * N_BLOCK;    // 256
 
 #define NUM_PRODUCER_WORKERS (8)
 #define NUM_CONSUMER_WORKERS (M_BLOCK * 4)
 #define NUM_THREADS ((NUM_PRODUCER_WORKERS + NUM_CONSUMER_WORKERS) * kittens::WARP_THREADS)
 #define NUM_PRODUCER_THREADS (NUM_PRODUCER_WORKERS * kittens::WARP_THREADS)
 
+#define PREFETCH_THREADS 256
+
 using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// All-Gather GEMM with Local Staging Buffer
-// Strategy: for each source rank r:
-//   1. Bulk copy A_shard[r] from remote XGMI → local staging buffer (HBM)
-//   2. GEMM: C += staging_A @ B[:, r*K_local:(r+1)*K_local]^T (all local HBM reads)
+// Fused All-Gather GEMM
+// Block IDs [0, num_prefetch_blocks): prefetcher blocks — copy remote A → a_local
+// Block IDs [num_prefetch_blocks, ...): GEMM blocks — spin on flags, compute from local
+
 struct ag_globals {
-    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
-    gl<bf16, -1, -1, -1, -1> a_staging; // [M, K_local] local HBM staging buffer
+    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap (own shard)
+    gl<bf16, -1, -1, -1, -1> a_local;   // [world_size * M, K_local] local HBM buffer
     gl<bf16, -1, -1, -1, -1> b;         // [N, K] local
     gl<bf16, -1, -1, -1, -1> c;         // [M, N] local output
     iris::iris_device_view iris_ctx;
@@ -36,37 +38,79 @@ struct ag_globals {
     int K;
     int K_local;
     int world_size;
+    int num_prefetch_blocks;
+    uintptr_t counters_ptr;   // device pointer to int[world_size] counters
 
     hipStream_t stream;
-    dim3 grid()  { return dim3(ceil_div(N, NEW_COL_BLOCK_SIZE),
-                              ceil_div(M, NEW_ROW_BLOCK_SIZE)); }
+
+    __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
+
+    int num_gemm_blocks() {
+        return ceil_div(N, NEW_COL_BLOCK_SIZE) * ceil_div(M, NEW_ROW_BLOCK_SIZE);
+    }
+    dim3 grid()  { return dim3(num_prefetch_blocks + num_gemm_blocks()); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return 98304; }
 };
 
-// Bulk vectorized copy kernel: remote A shard → local staging buffer
-// Uses int4 (16 bytes = 8 bf16 elements) for maximum memory bandwidth
-__global__ void copy_a_to_staging(bf16* __restrict__ dst,
-                                  const bf16* __restrict__ src,
-                                  int num_elements) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    // Vectorized copy: 8 bf16 = 16 bytes per int4
-    int4* dst4 = reinterpret_cast<int4*>(dst);
-    const int4* src4 = reinterpret_cast<const int4*>(src);
-    int num_vec = num_elements / 8;
-
-    for (int i = tid; i < num_vec; i += stride) {
-        dst4[i] = src4[i];
+// Spin-wait until counter[rank] >= target using volatile load
+__device__ __forceinline__ void spin_until_ready(volatile int* counters, int rank, int target) {
+    while (counters[rank] < target) {
+        // spin — volatile ensures re-read from memory
     }
+    __threadfence();  // ensure subsequent reads see the data written before the counter
 }
 
-// Per-rank GEMM kernel: processes K_local tiles for one source rank
-// Reads A from LOCAL staging buffer (fast HBM), B from local memory
-// For source_rank > 0: loads existing C to accumulate
+// ============================================================================
+// Fused kernel: prefetcher + GEMM blocks
+// ============================================================================
 __global__ __launch_bounds__(NUM_THREADS, 2)
-void ag_gemm_staged(ag_globals g, int source_rank) {
+void ag_gemm_fused(ag_globals g) {
+    int block_id = blockIdx.x;
+
+    // ════════════════════════════════════════════════════════
+    // Prefetcher blocks
+    // ════════════════════════════════════════════════════════
+    if (block_id < g.num_prefetch_blocks) {
+        if (threadIdx.x >= PREFETCH_THREADS) return;
+
+        int prefetch_id = block_id;
+        int cur_rank = g.iris_ctx.cur_rank();
+        uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+        int shard_elements = g.M * g.K_local;
+
+        for (int r = 0; r < g.world_size; r++) {
+            uintptr_t base_r = g.iris_ctx.get_heap_base(r);
+            intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
+            const bf16* remote_a = reinterpret_cast<const bf16*>(
+                (uintptr_t)g.a_shard.raw_ptr + delta);
+
+            bf16* dst = g.a_local.raw_ptr + r * shard_elements;
+
+            const int4* src4 = reinterpret_cast<const int4*>(remote_a);
+            int4* dst4 = reinterpret_cast<int4*>(dst);
+            int num_vec = shard_elements / 8;
+
+            int global_tid = prefetch_id * PREFETCH_THREADS + threadIdx.x;
+            int global_stride = g.num_prefetch_blocks * PREFETCH_THREADS;
+
+            for (int i = global_tid; i < num_vec; i += global_stride) {
+                dst4[i] = src4[i];
+            }
+
+            __threadfence();
+
+            if (threadIdx.x == 0) {
+                atomicAdd(&g.counters()[r], 1);
+            }
+        }
+        return;
+    }
+
+    // ════════════════════════════════════════════════════════
+    // GEMM blocks
+    // ════════════════════════════════════════════════════════
+    int gemm_block_id = block_id - g.num_prefetch_blocks;
 
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
@@ -77,9 +121,9 @@ void ag_gemm_staged(ag_globals g, int source_rank) {
     ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
     rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
 
-    // Workgroup ID + swizzle
-    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
-    const int NUM_WGS  = gridDim.x * gridDim.y;
+    // Workgroup ID mapping + swizzle
+    int wgid = gemm_block_id;
+    const int NUM_WGS = g.num_gemm_blocks();
     const int WGM = 4;
     wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
     const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
@@ -101,70 +145,112 @@ void ag_gemm_staged(ag_globals g, int source_rank) {
     int consumer_idx = is_consumer ? warp_group_id - 1 : 0;
 
     int K_local_tiles = g.K_local / BLOCK_SIZE;
-    int k_offset = source_rank * K_local_tiles; // Global B K-tile offset
+    int total_k_tiles = K_local_tiles * g.world_size;
+    int shard_elements = g.M * g.K_local;
 
+    auto a_gl = g.a_local;  // working copy — raw_ptr updated per rank
+
+    // Prefill swizzled offsets
     using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>::dtype;
     constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<T>();
     constexpr int bytes_per_memcpy = bytes_per_thread * NUM_PRODUCER_THREADS;
     constexpr int memcpy_per_tile = BLOCK_SIZE * BLOCK_SIZE * sizeof(T) / bytes_per_memcpy;
     uint32_t swizzled_offsets_A[memcpy_per_tile];
     uint32_t swizzled_offsets_B[memcpy_per_tile];
-    // A reads from LOCAL staging buffer (not remote)
-    G::prefill_swizzled_offsets(As[0][0][0], g.a_staging, swizzled_offsets_A);
+    G::prefill_swizzled_offsets(As[0][0][0], a_gl, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
 
-    // Prefetch tile 0: A from LOCAL staging, B at global K offset
-    if (is_producer) {
-        #pragma unroll
-        for (int m = 0; m < M_BLOCK; m++) {
-            G::load<2, false>(As[0][m][0], g.a_staging, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
-            G::load<2, false>(As[0][m][1], g.a_staging, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
-        }
-        #pragma unroll
-        for (int n = 0; n < N_BLOCK; n++) {
-            G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, k_offset + 0}, swizzled_offsets_B);
-            G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, k_offset + 0}, swizzled_offsets_B);
-        }
-        __builtin_amdgcn_s_waitcnt(0);
-    }
-    __syncthreads();
-
+    // Zero accumulators — stay in registers for ALL K tiles across ALL ranks
     if (is_consumer) {
-        if (source_rank == 0) {
-            // First rank: zero accumulators
-            zero(C_accum[0][0]);
-            zero(C_accum[0][1]);
-            zero(C_accum[1][0]);
-            zero(C_accum[1][1]);
-        } else {
-            // Subsequent ranks: load existing C (bf16→float32 conversion is automatic)
-            load(C_accum[0][0], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
-            load(C_accum[0][1], g.c, {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
-            load(C_accum[1][0], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
-            load(C_accum[1][1], g.c, {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
-        }
+        zero(C_accum[0][0]);
+        zero(C_accum[0][1]);
+        zero(C_accum[1][0]);
+        zero(C_accum[1][1]);
     }
 
-    int tic = 0, toc = 1;
+    volatile int* vol_counters = g.counters();
 
-    // K-tile loop over this rank's K_local tiles
-    for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
-        int next_local_k = tile + 1;
+    // ── Process each rank ──
+    for (int rank = 0; rank < g.world_size; rank++) {
+        // Spin until prefetchers have finished this rank
+        if (threadIdx.x == 0) {
+            spin_until_ready(vol_counters, rank, g.num_prefetch_blocks);
+        }
+        __syncthreads();
 
+        // Point a_gl to this rank's section of the a_local buffer
+        a_gl.raw_ptr = g.a_local.raw_ptr + rank * shard_elements;
+
+        int tic = 0, toc = 1;
+
+        // Prefetch first tile of this rank
         if (is_producer) {
-            // Prefetch next A tile from LOCAL staging + B tile
+            int global_k0 = rank * K_local_tiles;
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
-                G::load<2, false>(As[toc][m][0], g.a_staging, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
-                G::load<2, false>(As[toc][m][1], g.a_staging, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
+                G::load<2, false>(As[0][m][0], a_gl, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+                G::load<2, false>(As[0][m][1], a_gl, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
             }
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
-                G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, k_offset + next_local_k}, swizzled_offsets_B);
-                G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, k_offset + next_local_k}, swizzled_offsets_B);
+                G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, global_k0}, swizzled_offsets_B);
+                G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, global_k0}, swizzled_offsets_B);
             }
             __builtin_amdgcn_s_waitcnt(0);
-        } else if (is_consumer) {
+        }
+        __syncthreads();
+
+        // K-tile loop within this rank
+        for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
+            int next_local_k = tile + 1;
+            int next_global_k = rank * K_local_tiles + next_local_k;
+
+            if (is_producer) {
+                #pragma unroll
+                for (int m = 0; m < M_BLOCK; m++) {
+                    G::load<2, false>(As[toc][m][0], a_gl, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
+                    G::load<2, false>(As[toc][m][1], a_gl, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
+                }
+                #pragma unroll
+                for (int n = 0; n < N_BLOCK; n++) {
+                    G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_global_k}, swizzled_offsets_B);
+                    G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_global_k}, swizzled_offsets_B);
+                }
+                __builtin_amdgcn_s_waitcnt(0);
+            } else if (is_consumer) {
+                A_slice a0;
+                B_slice b0, b1;
+
+                auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+                load(b0, st_b);
+                auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+                load(a0, st_a);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+                __builtin_amdgcn_s_setprio(0);
+
+                st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+                load(b1, st_b);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+                __builtin_amdgcn_s_setprio(0);
+
+                st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+                load(a0, st_a);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+                mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+                __builtin_amdgcn_s_setprio(0);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
+        }
+
+        // Last tile of this rank — no prefetch needed
+        if (is_consumer) {
             A_slice a0;
             B_slice b0, b1;
 
@@ -192,41 +278,9 @@ void ag_gemm_staged(ag_globals g, int source_rank) {
             mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
             __builtin_amdgcn_s_setprio(0);
         }
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
     }
 
-    // Last tile — no prefetch needed
-    if (is_consumer) {
-        A_slice a0;
-        B_slice b0, b1;
-
-        auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
-        load(b0, st_b);
-        auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
-        load(a0, st_a);
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        __builtin_amdgcn_s_setprio(1);
-        mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
-        __builtin_amdgcn_s_setprio(0);
-
-        st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
-        load(b1, st_b);
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        __builtin_amdgcn_s_setprio(1);
-        mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
-        __builtin_amdgcn_s_setprio(0);
-
-        st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
-        load(a0, st_a);
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        __builtin_amdgcn_s_setprio(1);
-        mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
-        mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
-        __builtin_amdgcn_s_setprio(0);
-    }
-
-    // Store C
+    // Store C — single write, accumulated across all ranks
     if (is_consumer) {
         store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
         store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
@@ -237,39 +291,21 @@ void ag_gemm_staged(ag_globals g, int source_rank) {
 
 void dispatch_ag_gemm(ag_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
-    hipFuncSetAttribute((void*)ag_gemm_staged,
+    hipFuncSetAttribute((void*)ag_gemm_fused,
                         hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    int cur_rank = g.iris_ctx.cur_rank();
-    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
-    int shard_bytes = g.M * g.K_local * sizeof(bf16);
-    int num_elements = g.M * g.K_local;
+    // Zero counters before launch
+    hipMemsetAsync(g.counters(), 0, g.world_size * sizeof(int), g.stream);
 
-    int copy_blocks = 256;
-    int copy_threads = 256;
-
-    for (int r = 0; r < g.world_size; r++) {
-        // Compute remote A pointer for rank r
-        uintptr_t base_r = g.iris_ctx.get_heap_base(r);
-        intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
-        bf16* remote_a = reinterpret_cast<bf16*>(
-            (uintptr_t)g.a_shard.raw_ptr + delta);
-
-        // Phase 1: bulk copy remote A → local staging
-        // Use hipMemcpyAsync for DMA engine transfer (separate from CUs)
-        hipMemcpyAsync(g.a_staging.raw_ptr, remote_a, shard_bytes,
-                       hipMemcpyDeviceToDevice, g.stream);
-
-        // Phase 2: GEMM with all-local reads
-        ag_gemm_staged<<<g.grid(), g.block(), mem_size, g.stream>>>(g, r);
-    }
+    // Single fused launch
+    ag_gemm_fused<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — all-gather GEMM with local staging";
+    m.doc() = "tk_kernel python module — fused all-gather GEMM with prefetcher blocks";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
-        &ag_globals::a_staging,
+        &ag_globals::a_local,
         &ag_globals::b,
         &ag_globals::c,
         &ag_globals::iris_ctx,
@@ -277,6 +313,8 @@ PYBIND11_MODULE(tk_kernel, m) {
         &ag_globals::N,
         &ag_globals::K,
         &ag_globals::K_local,
-        &ag_globals::world_size
+        &ag_globals::world_size,
+        &ag_globals::num_prefetch_blocks,
+        &ag_globals::counters_ptr
     );
 }

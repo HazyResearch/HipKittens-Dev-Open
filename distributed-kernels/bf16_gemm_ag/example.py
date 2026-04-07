@@ -44,6 +44,7 @@ M = 192 * 40  # 7680
 K = 8192
 N = 8192
 scale = 10.0
+NUM_PREFETCH_BLOCKS = 32
 
 iris = iris_py.Iris(heap_size_mb=1024, verbose=False)
 rank = iris.rank()
@@ -54,9 +55,9 @@ K_local = K // world_size
 
 if rank == 0:
     print("="*60)
-    print(f"All-Gather GEMM (K-sharded, staged): C[{M},{N}] = sum_r(A_shard_r[{M},{K_local}] @ B[{N},{K}]^T)")
+    print(f"Fused AG-GEMM: C[{M},{N}] = sum_r(A_shard_r[{M},{K_local}] @ B[{N},{K}]^T)")
     print(f"A K-sharded: A_shard[{M},{K_local}] per rank, {world_size} ranks")
-    print(f"Using local staging buffer for XGMI→HBM copy")
+    print(f"Prefetcher blocks: {NUM_PREFETCH_BLOCKS}, GEMM blocks: {(M // 128) * (N // 256)}")
     print("="*60)
 
 # Allocate A_shard on iris heap (remote-accessible)
@@ -64,16 +65,20 @@ if rank == 0:
     print("\n[Allocating Tensors]")
 A_shard = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
 
-# Staging buffer: local HBM (not on iris heap), same shape as A_shard
-A_staging = torch.empty(M, K_local, dtype=torch.bfloat16, device='cuda')
+# a_local: local HBM buffer for all gathered A shards [world_size * M, K_local]
+A_local = torch.empty(world_size * M, K_local, dtype=torch.bfloat16, device='cuda')
 
-# B and C are local — regular CUDA memory
+# Atomic counters for prefetcher → GEMM synchronization
+counters = torch.zeros(world_size, dtype=torch.int32, device='cuda')
+
+# B and C are local
 B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
 C = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
 if rank == 0:
     print(f"  A_shard: {A_shard.shape} (iris heap)")
-    print(f"  A_staging: {A_staging.shape} (local HBM staging)")
+    print(f"  A_local: {A_local.shape} (local HBM, {A_local.nelement() * 2 / 1e6:.1f} MB)")
+    print(f"  counters: {counters.shape} (atomic sync)")
     print(f"  B: {B.shape} (local), C: {C.shape} (local)")
 
 # Verify iris backing for A_shard
@@ -100,14 +105,18 @@ C_ref = torch.matmul(A_full, B.t())     # [M, N]
 if rank == 0:
     print(f"  A_full: {A_full.shape}, C_ref: {C_ref.shape}")
 
-# Run AG-GEMM kernel (staged)
+# Run fused AG-GEMM kernel
 if rank == 0:
-    print("\n[Running AG-GEMM Kernel (staged, K-sharded)]")
+    print("\n[Running Fused AG-GEMM Kernel]")
 iris_device_ctx = iris.get_device_view()
 iris.barrier()
 
-tk_kernel.dispatch_ag_gemm(A_shard, A_staging, B, C, iris_device_ctx,
-                           M, N, K, K_local, world_size)
+# Get counters data pointer as int for passing to kernel
+counters_ptr = counters.data_ptr()
+
+tk_kernel.dispatch_ag_gemm(A_shard, A_local, B, C, iris_device_ctx,
+                           M, N, K, K_local, world_size,
+                           NUM_PREFETCH_BLOCKS, counters_ptr)
 torch.cuda.synchronize()
 iris.barrier()
 
@@ -128,7 +137,7 @@ if rank == 0:
 # Cleanup
 import gc
 from mpi4py import MPI
-del A_shard, A_staging, B, C, A_full, C_ref, A_full_list
+del A_shard, A_local, B, C, A_full, C_ref, A_full_list, counters
 gc.collect()
 torch.cuda.synchronize()
 iris.barrier()
