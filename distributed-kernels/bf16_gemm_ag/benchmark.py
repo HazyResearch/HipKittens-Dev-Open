@@ -191,13 +191,11 @@ for M, K, N in configs:
     # Host-side ring AG (iris.barrier() between steps — no in-kernel sync)
     host_ring_ag_ms = time_fn(call_host_ring_ag, "iris_host_ring_ag")
 
-    # In-kernel push ring AG (skip if hanging)
-    # push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
-    push_ring_ag_ms = host_ring_ag_ms  # placeholder
+    # In-kernel push ring AG
+    push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
 
     # Push ring AG + TK GEMM
-    # push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
-    push_ring_ag_gemm_ms = host_ring_ag_ms  # placeholder
+    push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
 
     # RCCL-based
     rccl_ag_ms = time_fn(call_rccl_ag, "rccl_ag")
@@ -239,7 +237,9 @@ for M, K, N in configs:
         print(f"  {'Iris copy (hipMemcpy, ring)':<35s}  {copy_memcpy_ms:10.3f}  {memcpy_bw:7.0f} GB/s")
         rccl_bw = total_bytes/1e9/(rccl_ag_ms*1e-3)
         host_ring_bw = total_bytes/1e9/(host_ring_ag_ms*1e-3)
+        push_bw = total_bytes/1e9/(push_ring_ag_ms*1e-3)
         print(f"  {'Iris host ring AG (barrier)':<35s}  {host_ring_ag_ms:10.3f}  {host_ring_bw:7.0f} GB/s")
+        print(f"  {'Iris push ring AG (in-kernel)':<35s}  {push_ring_ag_ms:10.3f}  {push_bw:7.0f} GB/s")
         print(f"  {'RCCL all_gather_into_tensor':<35s}  {rccl_ag_ms:10.3f}  {rccl_bw:7.0f} GB/s")
         print(f"  {'TK GEMM only':<35s}  {gemm_ms:10.3f}  {flops/(gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'rocBLAS matmul only':<35s}  {rocblas_ms:10.3f}  {flops/(rocblas_ms*1e-3)/1e12:8.1f}")

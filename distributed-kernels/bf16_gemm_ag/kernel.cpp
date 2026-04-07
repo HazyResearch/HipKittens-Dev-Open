@@ -824,18 +824,16 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 #define PUSH_RING_THREADS 1024
 
 __device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
-    __builtin_nontemporal_store(val, ptr);
+    __hip_atomic_store(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
-    return __builtin_nontemporal_load(ptr);
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Drain all pending stores — RCCL's skip_fence equivalent.
-// On fine-grained memory, once stores leave the write buffer they're visible
-// system-wide. No cache invalidation needed.
-__device__ __forceinline__ void drain_stores() {
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+// Fence: ensure all prior stores are visible system-wide before signaling
+__device__ __forceinline__ void fence_stores() {
+    __threadfence_system();
 }
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
@@ -906,8 +904,8 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
             // Last step: data already in a_local from prev rank's push
         }
 
-        // Drain pending stores — fine-grained memory makes them visible system-wide
-        drain_stores();
+        // Ensure stores are visible system-wide before signaling
+        fence_stores();
 
         // Signal completion (nontemporal store — no fence needed)
         if (threadIdx.x == 0) {
@@ -939,7 +937,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 32;
+    int num_channels = 1;  // Start with 1 to test correctness
 
     static bool printed = false;
     if (!printed) {
