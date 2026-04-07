@@ -928,7 +928,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 4;
+    int num_channels = 2;
 
     static bool printed = false;
     if (!printed) {
