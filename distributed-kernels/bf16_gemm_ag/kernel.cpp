@@ -67,12 +67,15 @@ void ag_copy_kernel(const bf16* __restrict__ a_shard_ptr,
     int global_tid = blockIdx.x * COPY_THREADS + threadIdx.x;
     int global_stride = gridDim.x * COPY_THREADS;
 
-    for (int r = 0; r < world_size; r++) {
-        uintptr_t base_r = iris_ctx.get_heap_base(r);
+    // Ring-ordered iteration: step 0 = local, step s = (cur+s)%W
+    // At each step all GPUs read from unique sources → no XGMI contention
+    for (int step = 0; step < world_size; step++) {
+        int src_rank = (cur_rank + step) % world_size;
+        uintptr_t base_r = iris_ctx.get_heap_base(src_rank);
         intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
         const int4* src4 = reinterpret_cast<const int4*>(
             (uintptr_t)a_shard_ptr + delta);
-        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + r * shard_elements);
+        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + src_rank * shard_elements);
         int num_vec = shard_elements / 8;
 
         for (int i = global_tid; i < num_vec; i += global_stride) {
@@ -323,10 +326,13 @@ void ag_fused_gemm_kernel(ag_globals g) {
         zero(C_accum[1][1]);
     }
 
-    // Ring-ordered iteration: step 0 reads local, then successive neighbors
-    // At each step, all GPUs read from different sources → no XGMI contention
+    // Ring-ordered iteration with block stagger:
+    // Different blocks start reading from different ranks to spread XGMI load.
+    // Block b starts at rank (cur_rank + b) % W, then proceeds in ring order.
+    // This ensures at any step, blocks are spread across all source ranks.
+    int block_offset = blockIdx.x % g.world_size;
     for (int step = 0; step < g.world_size; step++) {
-        int src_rank = (cur_rank + step) % g.world_size;
+        int src_rank = (cur_rank + step + block_offset) % g.world_size;
 
         // Translate pointer to src_rank's A shard on iris symmetric heap
         uintptr_t src_base = g.iris_ctx.get_heap_base(src_rank);
