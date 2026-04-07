@@ -319,8 +319,9 @@ void dispatch_ag_gemm(ag_globals g) {
 
     int total_blocks = max_blocks_per_cu * num_cus;
 
-    // DEBUG: force small grid to test persistent logic
-    total_blocks = 64;  // well under 256 CUs
+    // Scratch memory (196 bytes/lane) prevents full 256-block occupancy.
+    // Cap at 128 blocks — enough CUs for overlap, avoids deadlock.
+    if (total_blocks > 128) total_blocks = 128;
 
     // Print debug info (remove later)
     static bool printed = false;
