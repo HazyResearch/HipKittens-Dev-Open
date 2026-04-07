@@ -20,10 +20,10 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// Two-kernel approach:
-// 1. Lightweight copy kernel: all CUs copy remote A shards → a_local (max bandwidth)
-// 2. Persistent GEMM kernel: grab tiles from work queue, compute across all ranks
-// No spin-wait needed — stream ordering guarantees copy completes before GEMM starts.
+// Two-kernel AG-GEMM:
+// 1. ag_copy_kernel: all CUs copy remote A shards → local HBM (max XGMI bandwidth)
+// 2. ag_gemm_kernel: standard grid GEMM on pre-staged data, accumulates all ranks
+//    Single accumulator per output tile → one C store instead of load-accumulate-store per rank
 
 struct ag_globals {
     gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
@@ -37,8 +37,8 @@ struct ag_globals {
     int K;
     int K_local;
     int world_size;
-    uintptr_t counters_ptr;      // unused in two-kernel approach (kept for API compat)
-    uintptr_t work_counter_ptr;  // int — atomic GEMM tile counter
+    uintptr_t counters_ptr;      // unused (kept for API compat)
+    uintptr_t work_counter_ptr;  // unused (kept for API compat)
     int num_output_tiles;        // total GEMM tiles
 
     hipStream_t stream;
@@ -46,7 +46,9 @@ struct ag_globals {
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
     __host__ __device__ int* work_counter() { return reinterpret_cast<int*>(work_counter_ptr); }
 
-    size_t dynamic_shared_memory() { return 98304 + 16; } // +16 for scratch
+    dim3 grid() { return dim3(num_output_tiles); }
+    dim3 block() { return dim3(NUM_THREADS); }
+    size_t dynamic_shared_memory() { return 98304; }
 };
 
 // ============================================================================
@@ -80,11 +82,11 @@ void ag_copy_kernel(const bf16* __restrict__ a_shard_ptr,
 }
 
 // ============================================================================
-// Kernel 2: Persistent GEMM — grab tiles from work queue
-// All data already in a_local, no spin-wait needed
+// Kernel 2: Standard grid GEMM on pre-staged data
+// Each block handles one output tile, accumulates across all ranks
 // ============================================================================
 __global__ __launch_bounds__(NUM_THREADS, 2)
-void ag_gemm_persistent(ag_globals g) {
+void ag_gemm_kernel(ag_globals g) {
 
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
@@ -93,11 +95,6 @@ void ag_gemm_persistent(ag_globals g) {
     using ST_B = st_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>;
     ST_A (&As)[2][M_BLOCK][2] = al.allocate<ST_A, 2, M_BLOCK, 2>();
     ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
-
-    // Scratch space for broadcasting tile_id
-    int* sh_tile_id = reinterpret_cast<int*>(reinterpret_cast<char*>(&__shm[0]) + 98304);
-
-    int* work_ctr = g.work_counter();
 
     int warp_id = kittens::warpid();
     int local_warp_id = warp_id % 4;
@@ -111,6 +108,23 @@ void ag_gemm_persistent(ag_globals g) {
 
     auto a_gl = g.a_local;
 
+    // Map block → output tile with swizzle
+    const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
+    const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
+    const int WGM = 4;
+
+    int wgid = blockIdx.x;
+    const int NUM_WGS = g.num_output_tiles;
+    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
+    const int num_wgid_in_group = WGM * num_pid_n;
+    int group_id = wgid / num_wgid_in_group;
+    int first_pid_m = group_id * WGM;
+    int group_size_m = min(num_pid_m - first_pid_m, WGM);
+    int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
+    int pid_n = (wgid % num_wgid_in_group) / group_size_m;
+    int row = pid_m * M_BLOCK;
+    int col = pid_n * N_BLOCK;
+
     using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_16x32_s>::dtype;
     constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<T>();
     constexpr int bytes_per_memcpy = bytes_per_thread * NUM_PRODUCER_THREADS;
@@ -120,121 +134,57 @@ void ag_gemm_persistent(ag_globals g) {
     G::prefill_swizzled_offsets(As[0][0][0], a_gl, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0][0], g.b, swizzled_offsets_B);
 
-    const int num_pid_m = ceil_div(g.M, NEW_ROW_BLOCK_SIZE);
-    const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
-    const int WGM = 4;
-
-    // Accumulators
+    // Zero accumulators — single set for entire computation
     rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
+    if (is_consumer) {
+        zero(C_accum[0][0]);
+        zero(C_accum[0][1]);
+        zero(C_accum[1][0]);
+        zero(C_accum[1][1]);
+    }
 
-    // ── Persistent tile loop ──
-    while (true) {
-        // Thread 0 grabs next tile, broadcasts via shared memory
-        if (threadIdx.x == 0) {
-            *sh_tile_id = atomicAdd(work_ctr, 1);
+    // Process all ranks for this output tile
+    for (int rank = 0; rank < g.world_size; rank++) {
+        // Point a_gl to this rank's section (data already in a_local)
+        a_gl.raw_ptr = g.a_local.raw_ptr + rank * shard_elements;
+
+        int tic = 0, toc = 1;
+
+        // Prefetch first tile
+        if (is_producer) {
+            int global_k0 = rank * K_local_tiles;
+            #pragma unroll
+            for (int m = 0; m < M_BLOCK; m++) {
+                G::load<2, false>(As[0][m][0], a_gl, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
+                G::load<2, false>(As[0][m][1], a_gl, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+            }
+            #pragma unroll
+            for (int n = 0; n < N_BLOCK; n++) {
+                G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, global_k0}, swizzled_offsets_B);
+                G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, global_k0}, swizzled_offsets_B);
+            }
+            __builtin_amdgcn_s_waitcnt(0);
         }
         __syncthreads();
-        int tile_id = *sh_tile_id;
-        __syncthreads();
 
-        if (tile_id >= g.num_output_tiles) break;
+        // K-tile loop
+        for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
+            int next_local_k = tile + 1;
+            int next_global_k = rank * K_local_tiles + next_local_k;
 
-        // Map tile_id → (row, col) with swizzle
-        int wgid = tile_id;
-        const int NUM_WGS = g.num_output_tiles;
-        wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
-        const int num_wgid_in_group = WGM * num_pid_n;
-        int group_id = wgid / num_wgid_in_group;
-        int first_pid_m = group_id * WGM;
-        int group_size_m = min(num_pid_m - first_pid_m, WGM);
-        int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
-        int pid_n = (wgid % num_wgid_in_group) / group_size_m;
-        int row = pid_m * M_BLOCK;
-        int col = pid_n * N_BLOCK;
-
-        // Zero accumulators for this tile
-        if (is_consumer) {
-            zero(C_accum[0][0]);
-            zero(C_accum[0][1]);
-            zero(C_accum[1][0]);
-            zero(C_accum[1][1]);
-        }
-
-        // Process all ranks for this output tile
-        for (int rank = 0; rank < g.world_size; rank++) {
-            // Point a_gl to this rank's section (data already in a_local)
-            a_gl.raw_ptr = g.a_local.raw_ptr + rank * shard_elements;
-
-            int tic = 0, toc = 1;
-
-            // Prefetch first tile
             if (is_producer) {
-                int global_k0 = rank * K_local_tiles;
                 #pragma unroll
                 for (int m = 0; m < M_BLOCK; m++) {
-                    G::load<2, false>(As[0][m][0], a_gl, {0, 0, row*2 + 2*m + 0, 0}, swizzled_offsets_A);
-                    G::load<2, false>(As[0][m][1], a_gl, {0, 0, row*2 + 2*m + 1, 0}, swizzled_offsets_A);
+                    G::load<2, false>(As[toc][m][0], a_gl, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
+                    G::load<2, false>(As[toc][m][1], a_gl, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
                 }
                 #pragma unroll
                 for (int n = 0; n < N_BLOCK; n++) {
-                    G::load<2, false>(Bs[0][n][0], g.b, {0, 0, col*2 + 2*n + 0, global_k0}, swizzled_offsets_B);
-                    G::load<2, false>(Bs[0][n][1], g.b, {0, 0, col*2 + 2*n + 1, global_k0}, swizzled_offsets_B);
+                    G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_global_k}, swizzled_offsets_B);
+                    G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_global_k}, swizzled_offsets_B);
                 }
                 __builtin_amdgcn_s_waitcnt(0);
-            }
-            __syncthreads();
-
-            // K-tile loop
-            for (int tile = 0; tile < K_local_tiles - 1; tile++, tic ^= 1, toc ^= 1) {
-                int next_local_k = tile + 1;
-                int next_global_k = rank * K_local_tiles + next_local_k;
-
-                if (is_producer) {
-                    #pragma unroll
-                    for (int m = 0; m < M_BLOCK; m++) {
-                        G::load<2, false>(As[toc][m][0], a_gl, {0, 0, row*2 + 2*m + 0, next_local_k}, swizzled_offsets_A);
-                        G::load<2, false>(As[toc][m][1], a_gl, {0, 0, row*2 + 2*m + 1, next_local_k}, swizzled_offsets_A);
-                    }
-                    #pragma unroll
-                    for (int n = 0; n < N_BLOCK; n++) {
-                        G::load<2, false>(Bs[toc][n][0], g.b, {0, 0, col*2 + 2*n + 0, next_global_k}, swizzled_offsets_B);
-                        G::load<2, false>(Bs[toc][n][1], g.b, {0, 0, col*2 + 2*n + 1, next_global_k}, swizzled_offsets_B);
-                    }
-                    __builtin_amdgcn_s_waitcnt(0);
-                } else if (is_consumer) {
-                    A_slice a0;
-                    B_slice b0, b1;
-
-                    auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
-                    load(b0, st_b);
-                    auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
-                    load(a0, st_a);
-                    asm volatile("s_waitcnt lgkmcnt(0)");
-                    __builtin_amdgcn_s_setprio(1);
-                    mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
-                    __builtin_amdgcn_s_setprio(0);
-
-                    st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
-                    load(b1, st_b);
-                    asm volatile("s_waitcnt lgkmcnt(0)");
-                    __builtin_amdgcn_s_setprio(1);
-                    mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
-                    __builtin_amdgcn_s_setprio(0);
-
-                    st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
-                    load(a0, st_a);
-                    asm volatile("s_waitcnt lgkmcnt(0)");
-                    __builtin_amdgcn_s_setprio(1);
-                    mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
-                    mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
-                    __builtin_amdgcn_s_setprio(0);
-                }
-                __builtin_amdgcn_sched_barrier(0);
-                __builtin_amdgcn_s_barrier();
-            }
-
-            // Last tile of this rank
-            if (is_consumer) {
+            } else if (is_consumer) {
                 A_slice a0;
                 B_slice b0, b1;
 
@@ -262,15 +212,47 @@ void ag_gemm_persistent(ag_globals g) {
                 mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
                 __builtin_amdgcn_s_setprio(0);
             }
+            __builtin_amdgcn_sched_barrier(0);
+            __builtin_amdgcn_s_barrier();
         }
 
-        // Store C for this tile — single write across all ranks
+        // Last tile of this rank
         if (is_consumer) {
-            store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
-            store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
-            store(g.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
-            store(g.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
+            A_slice a0;
+            B_slice b0, b1;
+
+            auto st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][0], {0, 0});
+            load(b0, st_b);
+            auto st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][0], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_b = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(Bs[tic][local_warp_id][1], {0, 0});
+            load(b1, st_b);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
+            __builtin_amdgcn_s_setprio(0);
+
+            st_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0, 0});
+            load(a0, st_a);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_setprio(1);
+            mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);
+            mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
+            __builtin_amdgcn_s_setprio(0);
         }
+    }
+
+    // Store C — single write for this tile (accumulated across all ranks)
+    if (is_consumer) {
+        store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
+        store(g.c, C_accum[1][0], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 0});
+        store(g.c, C_accum[1][1], {0, 0, (row + consumer_idx) * 2 + 1, col * 2 + local_warp_id * 2 + 1});
     }
 }
 
@@ -285,48 +267,30 @@ void dispatch_ag_gemm(ag_globals g) {
         hipGetDeviceProperties(&props, device_id);
         int num_cus = props.multiProcessorCount;
 
-        // Launch with max CUs — copy kernel is lightweight
-        int copy_blocks = num_cus;  // 256 blocks, 1 per CU
+        int copy_blocks = num_cus;
         ag_copy_kernel<<<copy_blocks, COPY_THREADS, 0, g.stream>>>(
             g.a_shard.raw_ptr, g.a_local.raw_ptr,
             g.iris_ctx, shard_elements, g.world_size);
     }
 
-    // ── Phase 2: Persistent GEMM (stream ordering ensures copy is done) ──
+    // ── Phase 2: Standard grid GEMM (stream ordering ensures copy done) ──
     {
         const unsigned long mem_size = g.dynamic_shared_memory();
-        hipFuncSetAttribute((void*)ag_gemm_persistent,
+        hipFuncSetAttribute((void*)ag_gemm_kernel,
                             hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-
-        int max_blocks_per_cu;
-        hipOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_cu, (void*)ag_gemm_persistent, NUM_THREADS, mem_size);
-
-        int device_id;
-        hipGetDevice(&device_id);
-        hipDeviceProp_t props;
-        hipGetDeviceProperties(&props, device_id);
-        int num_cus = props.multiProcessorCount;
-
-        int total_blocks = max_blocks_per_cu * num_cus;
-        if (total_blocks > g.num_output_tiles) total_blocks = g.num_output_tiles;
 
         static bool printed = false;
         if (!printed) {
-            fprintf(stderr, "[ag_gemm] CUs=%d, max_blocks_per_cu=%d, gemm_blocks=%d, output_tiles=%d\n",
-                    num_cus, max_blocks_per_cu, total_blocks, g.num_output_tiles);
+            fprintf(stderr, "[ag_gemm] output_tiles=%d\n", g.num_output_tiles);
             printed = true;
         }
 
-        // Zero work counter
-        hipMemsetAsync(g.work_counter(), 0, sizeof(int), g.stream);
-
-        ag_gemm_persistent<<<total_blocks, NUM_THREADS, mem_size, g.stream>>>(g);
+        ag_gemm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
     }
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — persistent fused all-gather GEMM";
+    m.doc() = "tk_kernel python module — two-kernel all-gather GEMM";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
         &ag_globals::a_local,
