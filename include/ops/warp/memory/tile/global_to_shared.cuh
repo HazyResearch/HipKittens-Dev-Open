@@ -91,7 +91,7 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
             const int swizzled_global_col = (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) + subtile_col * ST::underlying_subtile_cols;
             const uint32_t swizzled_global_byte_offset = (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
 
-            uintptr_t lds_addr = lds_base + (memcpy_per_tile * num_warps * bytes_per_warp);
+            uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_base) + (memcpy_per_tile * num_warps * bytes_per_warp);
             as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
 
             llvm_amdgcn_raw_buffer_load_lds(
@@ -226,7 +226,7 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx, const uint
 
         if (warpid < leftover_warps) {
 
-            uintptr_t lds_addr = lds_base + (memcpy_per_tile * num_warps * bytes_per_warp);
+            uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_base) + (memcpy_per_tile * num_warps * bytes_per_warp);
             as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
 
             llvm_amdgcn_raw_buffer_load_lds(
