@@ -824,10 +824,12 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 #define PUSH_RING_THREADS 512
 #define PUSH_RING_NSTEPS 1  // sub-chunks per shard for pipelining (1 = no pipelining)
 
-// Broadcast push: each rank pushes its own shard to ALL other ranks' a_local.
-// No ring forwarding, no sync counters needed. Ring-ordered destinations to
-// avoid all ranks hitting the same target simultaneously.
-// a_local MUST be on iris heap for cross-GPU pointer translation.
+// Ring push with pipelining: each rank pushes to NEXT rank only.
+// Data flows through the ring in a pipeline. At steady state all links active.
+//
+// Uses cooperative groups for grid-wide barrier between pipeline steps.
+// Sync via per-rank counters on iris heap (one counter per ring step).
+// All blocks collaborate on each chunk.
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
 void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
@@ -835,29 +837,100 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
                          iris::iris_device_view iris_ctx,
                          int shard_elements, int world_size,
                          volatile uint64_t* __restrict__ counters,
-                         int num_channels) {
+                         int num_blocks_total) {
     int cur_rank = iris_ctx.cur_rank();
     uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
 
+    int next_rank = (cur_rank + 1) % world_size;
+    int prev_rank = (cur_rank + world_size - 1) % world_size;
+
+    // Pointers to next rank's a_local (for push writes)
+    uintptr_t next_base = iris_ctx.get_heap_base(next_rank);
+    intptr_t push_delta = (intptr_t)next_base - (intptr_t)local_base;
+    bf16* next_a_local = (bf16*)((uintptr_t)a_local_ptr + push_delta);
+
+    // Counter pointers: read prev rank's counter to know when data is available
+    uintptr_t prev_base = iris_ctx.get_heap_base(prev_rank);
+    intptr_t prev_delta = (intptr_t)prev_base - (intptr_t)local_base;
+    // Each rank has world_size-1 counters (one per ring step)
+    // counters[rank * (world_size-1) + step]
+    volatile uint64_t* my_counters = &counters[cur_rank * (world_size - 1)];
+    volatile uint64_t* prev_counters_remote = (volatile uint64_t*)(
+        (uintptr_t)&counters[prev_rank * (world_size - 1)] + prev_delta);
+
     int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
-    int global_stride = gridDim.x * PUSH_RING_THREADS;
+    int global_stride = num_blocks_total * PUSH_RING_THREADS;
     int shard_bytes = shard_elements * sizeof(bf16);
-    int num_vec = shard_bytes / sizeof(int4);  // int4 = 16 bytes = 8 bf16
+    int num_vec = shard_bytes / sizeof(int4);
 
-    // Push own shard to ALL ranks' a_local (including self), ring-ordered
-    // At step s, rank r pushes to rank (r + s) % W
-    // Step 0 = local copy, steps 1..W-1 = remote XGMI writes
-    for (int step = 0; step < world_size; step++) {
-        int dst_rank = (cur_rank + step) % world_size;
+    // Ring steps. At each step, each rank pushes one shard to next rank.
+    for (int step = 0; step < world_size - 1; step++) {
+        // Which original rank's data are we pushing?
+        // Step 0: our own shard
+        // Step s: the shard s positions back in the ring
+        int src_rank = (cur_rank - step + world_size) % world_size;
 
-        uintptr_t dst_base = iris_ctx.get_heap_base(dst_rank);
-        intptr_t delta = (intptr_t)dst_base - (intptr_t)local_base;
-        int4* dst4 = reinterpret_cast<int4*>(
-            (uintptr_t)a_local_ptr + delta + cur_rank * shard_bytes);
-        const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
+        if (step == 0) {
+            // directSend: read from local a_shard, write to local + push to next
+            const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
+            int4* dst_local4 = reinterpret_cast<int4*>(a_local_ptr + src_rank * shard_elements);
+            int4* dst_next4 = reinterpret_cast<int4*>(next_a_local + src_rank * shard_elements);
 
-        for (int i = global_tid; i < num_vec; i += global_stride) {
-            dst4[i] = src4[i];
+            for (int i = global_tid; i < num_vec; i += global_stride) {
+                int4 val = src4[i];
+                dst_local4[i] = val;
+                dst_next4[i] = val;
+            }
+        } else {
+            // Wait for prev rank to finish step-1 (they pushed data to our a_local)
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                while (__hip_atomic_load(
+                           const_cast<uint64_t*>(&prev_counters_remote[step - 1]),
+                           __ATOMIC_ACQUIRE,
+                           __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
+                    // spin
+                }
+            }
+            // Grid-wide barrier: block 0 sets flag, other blocks spin on it
+            // Using atomics on local counter as a grid barrier
+            __syncthreads();
+            if (blockIdx.x == 0 && threadIdx.x == 0) {
+                // Store flag to signal other blocks
+                __hip_atomic_store(
+                    const_cast<uint64_t*>(&counters[world_size * (world_size - 1) + step]),
+                    1ULL, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            }
+            if (blockIdx.x != 0 && threadIdx.x == 0) {
+                // Other blocks wait for block 0's signal
+                while (__hip_atomic_load(
+                           const_cast<uint64_t*>(&counters[world_size * (world_size - 1) + step]),
+                           __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+                }
+            }
+            __syncthreads();
+
+            // Read from local a_local (prev rank pushed here), forward to next
+            const int4* src4 = reinterpret_cast<const int4*>(a_local_ptr + src_rank * shard_elements);
+
+            if (step < world_size - 2) {
+                // Forward to next rank
+                int4* dst_next4 = reinterpret_cast<int4*>(next_a_local + src_rank * shard_elements);
+                for (int i = global_tid; i < num_vec; i += global_stride) {
+                    int4 val = src4[i];
+                    dst_next4[i] = val;
+                }
+            }
+            // Last step: data already in a_local, nothing more to do
+        }
+
+        // Ensure all writes are visible system-wide
+        __threadfence_system();
+
+        // Signal completion of this step (only block 0, thread 0)
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            __hip_atomic_store(
+                const_cast<uint64_t*>(&my_counters[step]),
+                1ULL, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
     }
 }
@@ -865,18 +938,23 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
 void dispatch_push_ring_ag(ag_globals g) {
     int shard_elements = g.M * g.K_local;
 
+    // Counters: need (world_size * (world_size-1)) for inter-rank sync
+    //         + (world_size-1) for intra-grid barrier flags
+    // Total: world_size * (world_size-1) + (world_size-1) = (world_size+1) * (world_size-1)
+    // For world_size=8: 9*7 = 63 uint64_t = 504 bytes
     volatile uint64_t* sync_counters = reinterpret_cast<volatile uint64_t*>(g.counters_ptr);
 
-    // Use all CUs for maximum bandwidth — no inter-block sync needed
+    // Use enough blocks but not too many — each block needs to participate in
+    // the grid barrier. 256 blocks should saturate XGMI bandwidth.
     int device_id;
     hipGetDevice(&device_id);
     hipDeviceProp_t props;
     hipGetDeviceProperties(&props, device_id);
-    int num_blocks = props.multiProcessorCount;  // 256 on MI355X
+    int num_blocks = props.multiProcessorCount;
 
     static bool printed = false;
     if (!printed) {
-        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d blocks x %d threads, broadcast push\n",
+        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d blocks x %d threads, ring push\n",
                 shard_elements, num_blocks, PUSH_RING_THREADS);
         printed = true;
     }
