@@ -882,9 +882,10 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
             int chunk_byte_off = chunk * chunk_elems * (int)sizeof(bf16);
 
             if (step > 0) {
-                // Wait for prev rank to signal this chunk is ready
+                // Wait for prev rank's PREVIOUS step (step-1) to signal this chunk.
+                // Prev rank pushes data for our step S during its step S-1.
                 if (threadIdx.x == 0) {
-                    while (ld_flag(&prev_counters[step]) < (uint64_t)(chunk + 1)) {
+                    while (ld_flag(&prev_counters[step - 1]) < (uint64_t)(chunk + 1)) {
                         __builtin_amdgcn_s_sleep(1);
                     }
                 }
