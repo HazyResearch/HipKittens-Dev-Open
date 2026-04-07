@@ -822,7 +822,7 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 // ============================================================================
 
 #define PUSH_RING_THREADS 512
-#define PUSH_RING_NSTEPS 8  // sub-chunks per shard for pipelining
+#define PUSH_RING_NSTEPS 1  // sub-chunks per shard for pipelining (1 = no pipelining)
 
 // Multi-channel push ring: each block is an independent "channel" that handles
 // a non-overlapping portion of each shard. No inter-block sync needed.
@@ -940,7 +940,7 @@ void dispatch_push_ring_ag(ag_globals g) {
     // Number of channels (blocks). Each channel handles shard_elements/num_channels
     // elements independently. More channels = more XGMI bandwidth utilization.
     // RCCL uses 8-16 channels typically. Start with 16.
-    int num_channels = 16;
+    int num_channels = 64;
 
     // Ensure shard_elements is divisible by num_channels * NSTEPS * 8 (int4 alignment)
     // shard_elements = M * K_local = 7680 * 1024 = 7864320
