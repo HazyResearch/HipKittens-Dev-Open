@@ -823,17 +823,19 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 
 #define PUSH_RING_THREADS 1024
 
-// RCCL skip_fence pattern: nontemporal for counters, s_waitcnt for data
+// Counter store: relaxed system-scope (no acquire/release overhead)
+// The s_waitcnt before this ensures data ordering.
 __device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
-    __builtin_nontemporal_store(val, ptr);
+    __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+// Counter read: relaxed system-scope (lightest cross-GPU load)
 __device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
-    return __builtin_nontemporal_load(ptr);
+    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Drain write buffer: s_waitcnt vmcnt(0) ensures all stores are visible
-// before the counter store. On fine-grained memory, this = system visibility.
+// Drain write buffer: ensures all stores visible before counter write.
+// On fine-grained memory, s_waitcnt vmcnt(0) = system visibility.
 __device__ __forceinline__ void fence_stores() {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
