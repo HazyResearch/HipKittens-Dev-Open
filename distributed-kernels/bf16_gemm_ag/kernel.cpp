@@ -22,13 +22,14 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// Fused All-Gather GEMM
-// Block IDs [0, num_prefetch_blocks): prefetcher blocks — copy remote A → a_local
-// Block IDs [num_prefetch_blocks, ...): GEMM blocks — spin on flags, compute from local
+// Fused All-Gather GEMM with row-block-level signaling
+// Prefetchers copy A row-block by row-block and signal per (rank, row_block).
+// GEMM blocks only spin on their own row_block — start computing as soon as
+// their 128 rows are ready, even while other row_blocks are still in flight.
 
 struct ag_globals {
-    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap (own shard)
-    gl<bf16, -1, -1, -1, -1> a_local;   // [world_size * M, K_local] local HBM buffer
+    gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
+    gl<bf16, -1, -1, -1, -1> a_local;   // [world_size * M, K_local] local HBM
     gl<bf16, -1, -1, -1, -1> b;         // [N, K] local
     gl<bf16, -1, -1, -1, -1> c;         // [M, N] local output
     iris::iris_device_view iris_ctx;
@@ -39,11 +40,12 @@ struct ag_globals {
     int K_local;
     int world_size;
     int num_prefetch_blocks;
-    uintptr_t counters_ptr;   // device pointer to int[world_size] counters
+    uintptr_t counters_ptr;   // int[world_size * num_row_blocks]
 
     hipStream_t stream;
 
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
+    __host__ __device__ int num_row_blocks() { return ceil_div(M, NEW_ROW_BLOCK_SIZE); }
 
     __host__ __device__ int num_gemm_blocks() {
         return ceil_div(N, NEW_COL_BLOCK_SIZE) * ceil_div(M, NEW_ROW_BLOCK_SIZE);
@@ -53,16 +55,16 @@ struct ag_globals {
     size_t dynamic_shared_memory() { return 98304; }
 };
 
-// Spin-wait until counter[rank] >= target using volatile load
-__device__ __forceinline__ void spin_until_ready(volatile int* counters, int rank, int target) {
-    while (counters[rank] < target) {
-        // spin — volatile ensures re-read from memory
+// Spin-wait on a single counter until >= target
+__device__ __forceinline__ void spin_until_ready(volatile int* counter, int target) {
+    while (*counter < target) {
+        // spin — volatile ensures re-read
     }
-    __threadfence();  // ensure subsequent reads see the data written before the counter
+    __threadfence();  // ensure subsequent reads see data written before the counter
 }
 
 // ============================================================================
-// Fused kernel: prefetcher + GEMM blocks
+// Fused kernel: prefetcher + GEMM blocks, row-block-level signaling
 // ============================================================================
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void ag_gemm_fused(ag_globals g) {
@@ -78,30 +80,41 @@ void ag_gemm_fused(ag_globals g) {
         int cur_rank = g.iris_ctx.cur_rank();
         uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
         int shard_elements = g.M * g.K_local;
+        int num_rb = g.num_row_blocks();
+
+        // Row-block dimensions
+        int rb_rows = NEW_ROW_BLOCK_SIZE;  // 128 rows per row-block
+        int rb_elements = rb_rows * g.K_local;  // elements per row-block
+
+        int global_tid = prefetch_id * PREFETCH_THREADS + threadIdx.x;
+        int global_stride = g.num_prefetch_blocks * PREFETCH_THREADS;
 
         for (int r = 0; r < g.world_size; r++) {
             uintptr_t base_r = g.iris_ctx.get_heap_base(r);
             intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
             const bf16* remote_a = reinterpret_cast<const bf16*>(
                 (uintptr_t)g.a_shard.raw_ptr + delta);
+            bf16* dst_base = g.a_local.raw_ptr + r * shard_elements;
 
-            bf16* dst = g.a_local.raw_ptr + r * shard_elements;
+            for (int rb = 0; rb < num_rb; rb++) {
+                int row_start = rb * rb_rows;
+                int actual_rows = min(rb_rows, g.M - row_start);
+                int actual_elements = actual_rows * g.K_local;
 
-            const int4* src4 = reinterpret_cast<const int4*>(remote_a);
-            int4* dst4 = reinterpret_cast<int4*>(dst);
-            int num_vec = shard_elements / 8;
+                // Source and dest for this row-block
+                const int4* src4 = reinterpret_cast<const int4*>(remote_a + row_start * g.K_local);
+                int4* dst4 = reinterpret_cast<int4*>(dst_base + row_start * g.K_local);
+                int num_vec = actual_elements / 8;
 
-            int global_tid = prefetch_id * PREFETCH_THREADS + threadIdx.x;
-            int global_stride = g.num_prefetch_blocks * PREFETCH_THREADS;
+                for (int i = global_tid; i < num_vec; i += global_stride) {
+                    dst4[i] = src4[i];
+                }
 
-            for (int i = global_tid; i < num_vec; i += global_stride) {
-                dst4[i] = src4[i];
-            }
+                __threadfence();
 
-            __threadfence();
-
-            if (threadIdx.x == 0) {
-                atomicAdd(&g.counters()[r], 1);
+                if (threadIdx.x == 0) {
+                    atomicAdd(&g.counters()[r * num_rb + rb], 1);
+                }
             }
         }
         return;
@@ -145,8 +158,8 @@ void ag_gemm_fused(ag_globals g) {
     int consumer_idx = is_consumer ? warp_group_id - 1 : 0;
 
     int K_local_tiles = g.K_local / BLOCK_SIZE;
-    int total_k_tiles = K_local_tiles * g.world_size;
     int shard_elements = g.M * g.K_local;
+    int num_rb = g.num_row_blocks();
 
     auto a_gl = g.a_local;  // working copy — raw_ptr updated per rank
 
@@ -172,13 +185,13 @@ void ag_gemm_fused(ag_globals g) {
 
     // ── Process each rank ──
     for (int rank = 0; rank < g.world_size; rank++) {
-        // Spin until prefetchers have finished this rank
+        // Spin only on THIS block's row_block for this rank
         if (threadIdx.x == 0) {
-            spin_until_ready(vol_counters, rank, g.num_prefetch_blocks);
+            spin_until_ready(&vol_counters[rank * num_rb + pid_m], g.num_prefetch_blocks);
         }
         __syncthreads();
 
-        // Point a_gl to this rank's section of the a_local buffer
+        // Point a_gl to this rank's section
         a_gl.raw_ptr = g.a_local.raw_ptr + rank * shard_elements;
 
         int tic = 0, toc = 1;
@@ -249,7 +262,7 @@ void ag_gemm_fused(ag_globals g) {
             __builtin_amdgcn_s_barrier();
         }
 
-        // Last tile of this rank — no prefetch needed
+        // Last tile of this rank
         if (is_consumer) {
             A_slice a0;
             B_slice b0, b1;
@@ -294,15 +307,16 @@ void dispatch_ag_gemm(ag_globals g) {
     hipFuncSetAttribute((void*)ag_gemm_fused,
                         hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    // Zero counters before launch
-    hipMemsetAsync(g.counters(), 0, g.world_size * sizeof(int), g.stream);
+    // Zero counters: world_size * num_row_blocks
+    int num_counters = g.world_size * g.num_row_blocks();
+    hipMemsetAsync(g.counters(), 0, num_counters * sizeof(int), g.stream);
 
     // Single fused launch
     ag_gemm_fused<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
-    m.doc() = "tk_kernel python module — fused all-gather GEMM with prefetcher blocks";
+    m.doc() = "tk_kernel python module — fused all-gather GEMM with row-block signaling";
     py::bind_function<dispatch_ag_gemm>(m, "dispatch_ag_gemm",
         &ag_globals::a_shard,
         &ag_globals::a_local,

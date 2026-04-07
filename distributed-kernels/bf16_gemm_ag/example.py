@@ -69,7 +69,9 @@ A_shard = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
 A_local = torch.empty(world_size * M, K_local, dtype=torch.bfloat16, device='cuda')
 
 # Atomic counters for prefetcher → GEMM synchronization
-counters = torch.zeros(world_size, dtype=torch.int32, device='cuda')
+# One counter per (rank, row_block) for fine-grained signaling
+num_row_blocks = M // 128  # NEW_ROW_BLOCK_SIZE = 128
+counters = torch.zeros(world_size * num_row_blocks, dtype=torch.int32, device='cuda')
 
 # B and C are local
 B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
