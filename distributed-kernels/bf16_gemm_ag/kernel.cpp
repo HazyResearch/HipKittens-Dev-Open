@@ -810,28 +810,32 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 // Multi-channel ring push: N independent channels (1 block each).
 // Each channel handles shard/N elements. Ring: push to next neighbor only.
 //
-// Sync: per-channel uint64_t step counters on iris heap (fine-grained).
+// Sync matches RCCL's skip_fence path (gfx9 fine-grained memory):
+// - Data ordering: s_waitcnt vmcnt(0) — drain write buffer, NO cache flush
 // - Counter writes: __builtin_nontemporal_store (bypass cache, instant vis)
-// - Counter reads: __atomic_load_n(..., __ATOMIC_RELAXED) (cheapest atomic)
-// - Data fence: __threadfence() (block-scope, NOT system-scope on gfx9)
-//   Fine-grained memory ensures stores are visible across XGMI without
-//   system-scope fences. RCCL does the same on gfx9.
+// - Counter reads: __builtin_nontemporal_load (bypass cache)
+// - NO __threadfence() or __threadfence_system() in hot loop
+//   Fine-grained memory = stores visible across XGMI once write buffer drains
 //
 // Layout: a_local[rank * shard_elements .. (rank+1) * shard_elements]
 //         a_local and counters MUST be on iris heap.
-//
-// counters[channel * world_size + rank] = step completed by rank for this channel
-// Total counters: num_channels * world_size uint64_t values
 // ============================================================================
 
-#define PUSH_RING_THREADS 512
+#define PUSH_RING_THREADS 1024
 
-__device__ __forceinline__ void st_relaxed_sys(uint64_t* ptr, uint64_t val) {
+__device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
     __builtin_nontemporal_store(val, ptr);
 }
 
-__device__ __forceinline__ uint64_t ld_relaxed_sys(uint64_t* ptr) {
-    return __atomic_load_n(ptr, __ATOMIC_RELAXED);
+__device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
+    return __builtin_nontemporal_load(ptr);
+}
+
+// Drain all pending stores — RCCL's skip_fence equivalent.
+// On fine-grained memory, once stores leave the write buffer they're visible
+// system-wide. No cache invalidation needed.
+__device__ __forceinline__ void drain_stores() {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
@@ -839,7 +843,7 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
                          bf16* __restrict__ a_local_ptr,
                          iris::iris_device_view iris_ctx,
                          int shard_elements, int world_size,
-                         volatile uint64_t* __restrict__ counters,
+                         uint64_t* __restrict__ counters,
                          int num_channels) {
     int channel = blockIdx.x;
     if (channel >= num_channels) return;
@@ -850,100 +854,96 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
     int next_rank = (cur_rank + 1) % world_size;
     int prev_rank = (cur_rank + world_size - 1) % world_size;
 
-    // Pointer translation deltas (bytes)
-    uintptr_t next_base = iris_ctx.get_heap_base(next_rank);
-    uintptr_t prev_base = iris_ctx.get_heap_base(prev_rank);
-    intptr_t push_delta = (intptr_t)next_base - (intptr_t)local_base;
-    intptr_t prev_delta = (intptr_t)prev_base - (intptr_t)local_base;
+    // Byte deltas for pointer translation
+    intptr_t push_delta = (intptr_t)iris_ctx.get_heap_base(next_rank) - (intptr_t)local_base;
+    intptr_t prev_delta = (intptr_t)iris_ctx.get_heap_base(prev_rank) - (intptr_t)local_base;
 
     // Next rank's a_local for push writes
     bf16* next_a_local = (bf16*)((uintptr_t)a_local_ptr + push_delta);
 
-    // My step counter (local memory, written by me, read by next rank)
-    // counters[channel * world_size + rank]
-    uint64_t* my_step_ptr = const_cast<uint64_t*>(
-        &counters[channel * world_size + cur_rank]);
-
-    // Prev rank's step counter (translated to prev rank's address space)
-    uint64_t* prev_step_ptr = (uint64_t*)(
+    // Step counters: counters[channel * world_size + rank]
+    uint64_t* my_step = &counters[channel * world_size + cur_rank];
+    uint64_t* prev_step = (uint64_t*)(
         (uintptr_t)&counters[channel * world_size + prev_rank] + prev_delta);
 
-    // This channel's slice of the shard
-    int channel_elements = shard_elements / num_channels;
-    int channel_offset = channel * channel_elements;
-    int channel_bytes = channel_elements * sizeof(bf16);
-    int num_vec = channel_bytes / sizeof(int4);
+    // This channel's portion of the shard
+    int ch_elems = shard_elements / num_channels;
+    int ch_off_bytes = channel * ch_elems * (int)sizeof(bf16);
+    int num_vec = ch_elems * (int)sizeof(bf16) / (int)sizeof(int4);
 
-    // Ring: W-1 steps
     for (int step = 0; step < world_size - 1; step++) {
-        // Which original rank's shard are we forwarding?
         int src_rank = (cur_rank - step + world_size) % world_size;
-        int shard_byte_offset = src_rank * shard_elements * sizeof(bf16);
+        int shard_off = src_rank * shard_elements * (int)sizeof(bf16);
 
         if (step == 0) {
-            // directSend: read local a_shard, write to local a_local + push to next
-            const int4* src4 = reinterpret_cast<const int4*>(
-                (char*)a_shard_ptr + channel_offset * sizeof(bf16));
-            int4* dst_local4 = reinterpret_cast<int4*>(
-                (char*)a_local_ptr + shard_byte_offset + channel_offset * sizeof(bf16));
-            int4* dst_next4 = reinterpret_cast<int4*>(
-                (char*)next_a_local + shard_byte_offset + channel_offset * sizeof(bf16));
+            // directSend: local a_shard → local a_local + next rank's a_local
+            const int4* src = reinterpret_cast<const int4*>((char*)a_shard_ptr + ch_off_bytes);
+            int4* dst_local = reinterpret_cast<int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
+            int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
 
             for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
-                int4 val = src4[i];
-                dst_local4[i] = val;
-                dst_next4[i] = val;
+                int4 v = src[i];
+                dst_local[i] = v;
+                dst_next[i] = v;
             }
         } else {
-            // Wait for prev rank to finish previous step
-            // Only thread 0 spins; rest wait at __syncthreads
+            // Wait for prev rank's step completion
             if (threadIdx.x == 0) {
-                uint64_t needed = step;  // prev rank's step counter >= step means done
-                while (ld_relaxed_sys(prev_step_ptr) < needed) {
+                while (ld_flag(prev_step) < (uint64_t)step) {
                     __builtin_amdgcn_s_sleep(1);
                 }
             }
             __syncthreads();
 
-            // Read from LOCAL a_local (prev rank pushed data here)
-            const int4* src4 = reinterpret_cast<const int4*>(
-                (char*)a_local_ptr + shard_byte_offset + channel_offset * sizeof(bf16));
-
             if (step < world_size - 2) {
-                // directRecvCopyDirectSend: forward to next rank
-                int4* dst_next4 = reinterpret_cast<int4*>(
-                    (char*)next_a_local + shard_byte_offset + channel_offset * sizeof(bf16));
+                // directRecvCopyDirectSend: read local, forward to next
+                const int4* src = reinterpret_cast<const int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
+                int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
                 for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
-                    dst_next4[i] = src4[i];
+                    dst_next[i] = src[i];
                 }
             }
-            // Last step (step == W-2): data already in a_local, nothing to push
+            // Last step: data already in a_local from prev rank's push
         }
 
-        // Block-scope fence (NOT system-scope): fine-grained memory
-        // ensures stores are visible across XGMI without __threadfence_system()
-        __threadfence();
-        __syncthreads();
+        // Drain pending stores — fine-grained memory makes them visible system-wide
+        drain_stores();
 
-        // Signal completion: nontemporal store (bypasses cache, instant vis on fine-grained)
+        // Signal completion (nontemporal store — no fence needed)
         if (threadIdx.x == 0) {
-            st_relaxed_sys(my_step_ptr, (uint64_t)(step + 1));
+            st_flag(my_step, (uint64_t)(step + 1));
         }
+    }
+}
+
+// ── Single-step ring copy kernel (for host-side ring dispatch) ──
+// Copies one shard slice from local → next rank's a_local
+// No sync — host manages step ordering via stream + barriers
+__global__ __launch_bounds__(PUSH_RING_THREADS, 1)
+void ag_ring_step_kernel(bf16* __restrict__ src_ptr,
+                         bf16* __restrict__ dst_ptr,
+                         int num_elements) {
+    int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
+    int global_stride = gridDim.x * PUSH_RING_THREADS;
+    int num_vec = num_elements * (int)sizeof(bf16) / (int)sizeof(int4);
+    const int4* src4 = reinterpret_cast<const int4*>(src_ptr);
+    int4* dst4 = reinterpret_cast<int4*>(dst_ptr);
+
+    for (int i = global_tid; i < num_vec; i += global_stride) {
+        dst4[i] = src4[i];
     }
 }
 
 void dispatch_push_ring_ag(ag_globals g) {
     int shard_elements = g.M * g.K_local;
 
-    volatile uint64_t* sync_counters = reinterpret_cast<volatile uint64_t*>(g.counters_ptr);
+    uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    // Multi-channel: each channel = 1 block. More channels = more XGMI saturation.
-    // RCCL uses 8-32 channels. Start with 32.
     int num_channels = 32;
 
     static bool printed = false;
     if (!printed) {
-        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d channels x %d threads, ring push\n",
+        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d channels x %d threads, ring push (s_waitcnt)\n",
                 shard_elements, num_channels, PUSH_RING_THREADS);
         printed = true;
     }
@@ -952,6 +952,57 @@ void dispatch_push_ring_ag(ag_globals g) {
         g.a_shard.raw_ptr, g.a_local.raw_ptr,
         g.iris_ctx, shard_elements, g.world_size,
         sync_counters, num_channels);
+}
+
+// Host-side ring: separate kernel per step, stream ordering handles sync.
+// iris.barrier() between steps ensures cross-GPU visibility.
+// This isolates XGMI bandwidth from sync overhead.
+void dispatch_push_ring_host(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int shard_bytes = shard_elements * sizeof(bf16);
+    int cur_rank = g.iris_ctx.cur_rank();
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+    int next_rank = (cur_rank + 1) % g.world_size;
+    intptr_t push_delta = (intptr_t)g.iris_ctx.get_heap_base(next_rank) - (intptr_t)local_base;
+    bf16* next_a_local = (bf16*)((uintptr_t)g.a_local.raw_ptr + push_delta);
+
+    int device_id;
+    hipGetDevice(&device_id);
+    hipDeviceProp_t props;
+    hipGetDeviceProperties(&props, device_id);
+    int num_blocks = props.multiProcessorCount;
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[push_ring_host] shard=%d, %d blocks, host-side ring\n",
+                shard_elements, num_blocks);
+        printed = true;
+    }
+
+    for (int step = 0; step < g.world_size - 1; step++) {
+        int src_rank = (cur_rank - step + g.world_size) % g.world_size;
+
+        if (step == 0) {
+            // Copy own shard to local a_local
+            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+                g.a_shard.raw_ptr,
+                g.a_local.raw_ptr + src_rank * shard_elements,
+                shard_elements);
+            // Push own shard to next rank's a_local
+            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+                g.a_shard.raw_ptr,
+                next_a_local + src_rank * shard_elements,
+                shard_elements);
+        } else if (step < g.world_size - 2) {
+            // Forward: read from local a_local, push to next rank
+            ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+                g.a_local.raw_ptr + src_rank * shard_elements,
+                next_a_local + src_rank * shard_elements,
+                shard_elements);
+        }
+        // Last step: data already in a_local, nothing to push
+        // NOTE: caller must call iris.barrier() between steps for cross-GPU sync
+    }
 }
 
 // Push ring AG + standard TK GEMM (sequential, for comparison with RCCL+TK)
