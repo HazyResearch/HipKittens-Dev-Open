@@ -841,27 +841,19 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
 
     int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
     int global_stride = gridDim.x * PUSH_RING_THREADS;
-    int num_vec = shard_elements / 8;  // int4 = 8 bf16
+    int shard_bytes = shard_elements * sizeof(bf16);
+    int num_vec = shard_bytes / sizeof(int4);  // int4 = 16 bytes = 8 bf16
 
-    // First: copy own shard to own a_local slot (local HBM → local HBM)
-    {
-        const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
-        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + cur_rank * shard_elements);
-        for (int i = global_tid; i < num_vec; i += global_stride) {
-            dst4[i] = src4[i];
-        }
-    }
-
-    // Then: push own shard to each remote rank's a_local, ring-ordered
-    // At step s, rank r pushes to rank (r + s + 1) % W
-    // This means at each step, all GPUs write to different destinations → no contention
-    for (int step = 0; step < world_size - 1; step++) {
-        int dst_rank = (cur_rank + step + 1) % world_size;
+    // Push own shard to ALL ranks' a_local (including self), ring-ordered
+    // At step s, rank r pushes to rank (r + s) % W
+    // Step 0 = local copy, steps 1..W-1 = remote XGMI writes
+    for (int step = 0; step < world_size; step++) {
+        int dst_rank = (cur_rank + step) % world_size;
 
         uintptr_t dst_base = iris_ctx.get_heap_base(dst_rank);
         intptr_t delta = (intptr_t)dst_base - (intptr_t)local_base;
         int4* dst4 = reinterpret_cast<int4*>(
-            (uintptr_t)a_local_ptr + delta + (uintptr_t)(cur_rank * shard_elements * sizeof(bf16)));
+            (uintptr_t)a_local_ptr + delta + cur_rank * shard_bytes);
         const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
 
         for (int i = global_tid; i < num_vec; i += global_stride) {
