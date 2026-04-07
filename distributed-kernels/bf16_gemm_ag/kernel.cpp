@@ -493,6 +493,23 @@ void dispatch_copy_only(ag_globals g) {
         g.iris_ctx, shard_elements, g.world_size);
 }
 
+// Copy using hipMemcpyAsync (DMA engine) — ring-ordered
+void dispatch_copy_memcpy(ag_globals g) {
+    int cur_rank = g.iris_ctx.cur_rank();
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+    int shard_elements = g.M * g.K_local;
+    size_t shard_bytes = shard_elements * sizeof(bf16);
+
+    for (int step = 0; step < g.world_size; step++) {
+        int src_rank = (cur_rank + step) % g.world_size;
+        uintptr_t src_base = g.iris_ctx.get_heap_base(src_rank);
+        intptr_t delta = (intptr_t)src_base - (intptr_t)local_base;
+        const void* src = (const void*)((uintptr_t)g.a_shard.raw_ptr + delta);
+        void* dst = (void*)(g.a_local.raw_ptr + src_rank * shard_elements);
+        hipMemcpyAsync(dst, src, shard_bytes, hipMemcpyDeviceToDevice, g.stream);
+    }
+}
+
 // GEMM only — assumes data already in a_local
 void dispatch_gemm_only(ag_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
@@ -809,4 +826,5 @@ PYBIND11_MODULE(tk_kernel, m) {
     py::bind_function<dispatch_gemm_only>(m, "dispatch_gemm_only", BIND_AG_GLOBALS);
     py::bind_function<dispatch_fused_ag_gemm>(m, "dispatch_fused_ag_gemm", BIND_AG_GLOBALS);
     py::bind_function<dispatch_pipelined_ag_gemm>(m, "dispatch_pipelined_ag_gemm", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_copy_memcpy>(m, "dispatch_copy_memcpy", BIND_AG_GLOBALS);
 }

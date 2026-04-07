@@ -148,6 +148,10 @@ for M, K, N in configs:
         A_shard_iris, A_local, B, C, iris_device_ctx, M, N, K, K_local, world_size,
         counters_ptr, work_ptr, num_output_tiles), "iris_copy")
 
+    copy_memcpy_ms = time_fn(lambda: tk_kernel.dispatch_copy_memcpy(
+        A_shard_iris, A_local, B, C, iris_device_ctx, M, N, K, K_local, world_size,
+        counters_ptr, work_ptr, num_output_tiles), "iris_memcpy_copy")
+
     # Stage data for GEMM-only timing
     tk_kernel.dispatch_copy_only(A_shard_iris, A_local, B, C,
                                  iris_device_ctx, M, N, K, K_local, world_size,
@@ -192,9 +196,12 @@ for M, K, N in configs:
         print()
         print(f"  {'Approach':<35s}  {'Time (ms)':>10s}  {'TFLOPS':>8s}")
         print(f"  {'-'*58}")
-        copy_bw = world_size*M*K_local*2/1e9/(copy_iris_ms*1e-3)
-        print(f"  {'Iris copy (ring-ordered)':<35s}  {copy_iris_ms:10.3f}  {copy_bw:7.0f} GB/s")
-        rccl_bw = world_size*M*K_local*2/1e9/(rccl_ag_ms*1e-3)
+        total_bytes = world_size*M*K_local*2
+        copy_bw = total_bytes/1e9/(copy_iris_ms*1e-3)
+        print(f"  {'Iris copy (kernel, ring)':<35s}  {copy_iris_ms:10.3f}  {copy_bw:7.0f} GB/s")
+        memcpy_bw = total_bytes/1e9/(copy_memcpy_ms*1e-3)
+        print(f"  {'Iris copy (hipMemcpy, ring)':<35s}  {copy_memcpy_ms:10.3f}  {memcpy_bw:7.0f} GB/s")
+        rccl_bw = total_bytes/1e9/(rccl_ag_ms*1e-3)
         print(f"  {'RCCL all_gather_into_tensor':<35s}  {rccl_ag_ms:10.3f}  {rccl_bw:7.0f} GB/s")
         print(f"  {'TK GEMM only':<35s}  {gemm_ms:10.3f}  {flops/(gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'rocBLAS matmul only':<35s}  {rocblas_ms:10.3f}  {flops/(rocblas_ms*1e-3)/1e12:8.1f}")
