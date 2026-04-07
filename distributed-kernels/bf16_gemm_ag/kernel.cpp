@@ -316,6 +316,18 @@ void dispatch_ag_gemm(ag_globals g) {
 
     int total_blocks = max_blocks_per_cu * num_cus;
 
+    // Clamp to something reasonable — don't over-subscribe
+    // Need at least num_output_tiles blocks' worth of work, but persistent blocks loop
+    if (total_blocks > 1920) total_blocks = 1920;  // no more than output tiles
+
+    // Print debug info (remove later)
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[ag_gemm] CUs=%d, max_blocks_per_cu=%d, total_blocks=%d, output_tiles=%d\n",
+                num_cus, max_blocks_per_cu, total_blocks, g.num_output_tiles);
+        printed = true;
+    }
+
     // Zero counters + work counter
     hipMemsetAsync(g.counters(), 0, g.world_size * sizeof(int), g.stream);
     hipMemsetAsync(g.work_counter(), 0, sizeof(int), g.stream);
