@@ -64,13 +64,20 @@ if rank == 0:
 if rank == 0:
     print("\n[Allocating Tensors]")
 A_shard = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
-A_local = torch.empty(world_size * M, K_local, dtype=torch.bfloat16, device='cuda')
+# a_local on iris heap so push ring AG can write to remote ranks' a_local
+A_local = make_iris_tensor(iris, [world_size * M, K_local], dtype="bfloat16")
 B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
 C = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
 # Counters: per-rank copy-done + 1 work counter
 counters = torch.zeros(world_size, dtype=torch.int32, device='cuda')
 work_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
+# Sync counters for push ring AG on iris heap
+# Layout: (rank * num_channels + channel) * (world_size - 1) + step
+# Max: world_size * 16 channels * (world_size - 1) uint64_t = 8 * 16 * 7 = 896 uint64_t
+# Allocate as bf16 array (4 bf16 = 8 bytes = 1 uint64_t), add generous padding
+sync_counters = make_iris_tensor(iris, [4096], dtype="bfloat16")
+sync_counters_ptr = sync_counters.data_ptr()
 
 if rank == 0:
     print(f"  A_shard: {A_shard.shape} (iris heap)")
@@ -166,17 +173,40 @@ mean_error = diff.mean().item()
 pipelined_status = "PASSED" if max_error < 0.5 else "FAILED"
 print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {pipelined_status}")
 
-overall = "PASSED" if staged_status == "PASSED" and fused_status == "PASSED" and pipelined_status == "PASSED" else "FAILED"
+# Run push ring AG + GEMM
+if rank == 0:
+    print("\n[Running Push Ring AG + GEMM]")
+C.zero_()
+sync_counters.zero_()
+iris.barrier()
+
+tk_kernel.dispatch_push_ring_ag_gemm(A_shard, A_local, B, C, iris_device_ctx,
+                                      M, N, K, K_local, world_size,
+                                      sync_counters_ptr, work_counter.data_ptr(),
+                                      num_output_tiles)
+torch.cuda.synchronize()
+iris.barrier()
+
+# Validate push ring
+if rank == 0:
+    print("\n[Validating Push Ring AG + GEMM Results]")
+diff = (C.float() - C_ref.float()).abs()
+max_error = diff.max().item()
+mean_error = diff.mean().item()
+push_ring_status = "PASSED" if max_error < 0.5 else "FAILED"
+print(f"Rank {rank}: max_error={max_error:.4f}, mean_error={mean_error:.6f}, {push_ring_status}")
+
+overall = "PASSED" if staged_status == "PASSED" and fused_status == "PASSED" and pipelined_status == "PASSED" and push_ring_status == "PASSED" else "FAILED"
 if rank == 0:
     print("\n" + "="*60)
-    print(f"Staged: {staged_status}, Fused: {fused_status}, Pipelined: {pipelined_status}")
+    print(f"Staged: {staged_status}, Fused: {fused_status}, Pipelined: {pipelined_status}, PushRing: {push_ring_status}")
     print(f"Result: {overall}")
     print("="*60)
 
 # Cleanup
 import gc
 from mpi4py import MPI
-del A_shard, A_local, B, C, A_full, C_ref, A_full_list, counters, work_counter
+del A_shard, A_local, B, C, A_full, C_ref, A_full_list, counters, work_counter, sync_counters
 gc.collect()
 torch.cuda.synchronize()
 iris.barrier()

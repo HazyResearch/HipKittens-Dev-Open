@@ -72,9 +72,13 @@ for M, K, N in configs:
     num_output_tiles = (M // 128) * (N // 256)
 
     A_shard_iris = make_iris_tensor(iris, [M, K_local], dtype="bfloat16")
-    A_local = torch.empty(world_size * M, K_local, dtype=torch.bfloat16, device='cuda')
+    # a_local on iris heap so push ring AG can write to remote ranks' a_local
+    A_local = make_iris_tensor(iris, [world_size * M, K_local], dtype="bfloat16")
     counters = torch.zeros(world_size, dtype=torch.int32, device='cuda')
     work_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
+    # Sync counters for push ring AG on iris heap (generous size for multi-channel)
+    sync_counters = make_iris_tensor(iris, [4096], dtype="bfloat16")
+    sync_counters_ptr = sync_counters.data_ptr()
     B = torch.empty(N, K, dtype=torch.bfloat16, device='cuda')
     C = torch.empty(M, N, dtype=torch.bfloat16, device='cuda')
 
@@ -112,6 +116,18 @@ for M, K, N in configs:
         tk_kernel.dispatch_pipelined_ag_gemm(A_shard_iris, A_local, B, C,
                                               iris_device_ctx, M, N, K, K_local, world_size,
                                               counters_ptr, work_ptr, num_output_tiles)
+
+    def call_push_ring_ag():
+        sync_counters.zero_()
+        tk_kernel.dispatch_push_ring_ag(A_shard_iris, A_local, B, C,
+                                         iris_device_ctx, M, N, K, K_local, world_size,
+                                         sync_counters_ptr, work_ptr, num_output_tiles)
+
+    def call_push_ring_ag_gemm():
+        sync_counters.zero_()
+        tk_kernel.dispatch_push_ring_ag_gemm(A_shard_iris, A_local, B, C,
+                                              iris_device_ctx, M, N, K, K_local, world_size,
+                                              sync_counters_ptr, work_ptr, num_output_tiles)
 
     def call_rccl_ag():
         dist.all_gather_into_tensor(A_local, A_shard_torch)
@@ -163,6 +179,12 @@ for M, K, N in configs:
     fused_iris_ms = time_fn(call_fused, "iris_fused")
     pipelined_iris_ms = time_fn(call_pipelined, "iris_pipelined")
 
+    # Push ring AG (iris, RCCL-style)
+    push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
+
+    # Push ring AG + TK GEMM
+    push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
+
     # RCCL-based
     rccl_ag_ms = time_fn(call_rccl_ag, "rccl_ag")
 
@@ -202,6 +224,8 @@ for M, K, N in configs:
         memcpy_bw = total_bytes/1e9/(copy_memcpy_ms*1e-3)
         print(f"  {'Iris copy (hipMemcpy, ring)':<35s}  {copy_memcpy_ms:10.3f}  {memcpy_bw:7.0f} GB/s")
         rccl_bw = total_bytes/1e9/(rccl_ag_ms*1e-3)
+        push_bw = total_bytes/1e9/(push_ring_ag_ms*1e-3)
+        print(f"  {'Iris push ring AG':<35s}  {push_ring_ag_ms:10.3f}  {push_bw:7.0f} GB/s")
         print(f"  {'RCCL all_gather_into_tensor':<35s}  {rccl_ag_ms:10.3f}  {rccl_bw:7.0f} GB/s")
         print(f"  {'TK GEMM only':<35s}  {gemm_ms:10.3f}  {flops/(gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'rocBLAS matmul only':<35s}  {rocblas_ms:10.3f}  {flops/(rocblas_ms*1e-3)/1e12:8.1f}")
@@ -209,6 +233,7 @@ for M, K, N in configs:
         print(f"  {'Iris copy + TK GEMM (staged)':<35s}  {full_iris_ms:10.3f}  {flops/(full_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris fused AG-GEMM (ring)':<35s}  {fused_iris_ms:10.3f}  {flops/(fused_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris pipelined (copy||GEMM)':<35s}  {pipelined_iris_ms:10.3f}  {flops/(pipelined_iris_ms*1e-3)/1e12:8.1f}")
+        print(f"  {'Iris push ring AG + TK GEMM':<35s}  {push_ring_ag_gemm_ms:10.3f}  {flops/(push_ring_ag_gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'RCCL AG + TK GEMM':<35s}  {rccl_tk_ms:10.3f}  {flops/(rccl_tk_ms*1e-3)/1e12:8.1f}")
         print(f"  {'torch AG + rocBLAS (baseline)':<35s}  {torch_ms:10.3f}  {flops/(torch_ms*1e-3)/1e12:8.1f}")
         print(f"  {'-'*58}")
@@ -218,7 +243,7 @@ for M, K, N in configs:
         print(f"  Best iris ({best_name}) vs RCCL+TK: {rccl_tk_ms/best_iris:.2f}x")
         print(f"  Pipelined vs staged: {full_iris_ms/pipelined_iris_ms:.2f}x")
 
-    del A_shard_iris, A_local, counters, work_counter, B, C, iris_device_ctx
+    del A_shard_iris, A_local, counters, work_counter, sync_counters, B, C, iris_device_ctx
     del A_shard_torch, A_shards_list, A_full_local
     import gc; gc.collect()
     torch.cuda.synchronize()
