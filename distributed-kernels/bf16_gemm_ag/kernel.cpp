@@ -841,18 +841,20 @@ __device__ __forceinline__ void fence_stores() {
     asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 }
 
-// RCCL-style pipelined ring push all-gather (single block)
-// One block with 1024 threads. Splits each shard into NCHUNKS sub-chunks.
-// Per-chunk counters allow pipelining: prev rank signals chunk-by-chunk.
-#define NCHUNKS 8
-
+// Multi-channel ring push all-gather
+// Each channel = 1 block processing shard/num_channels elements through all ring steps.
+// One counter per channel per rank: counters[channel * world_size + rank]
+// Value = completed step count (1..world_size-1)
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
 void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
                          bf16* __restrict__ a_local_ptr,
                          iris::iris_device_view iris_ctx,
                          int shard_elements, int world_size,
                          uint64_t* __restrict__ counters,
-                         int /*num_channels_unused*/) {
+                         int num_channels) {
+    int channel = blockIdx.x;
+    if (channel >= num_channels) return;
+
     int cur_rank = iris_ctx.cur_rank();
     uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
 
@@ -864,66 +866,55 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
 
     bf16* next_a_local = (bf16*)((uintptr_t)a_local_ptr + push_delta);
 
-    // Counter: one per rank per step. counters[rank * num_steps + step]
-    // Value = number of chunks completed for that step
-    int num_steps = world_size - 1;
-    uint64_t* my_counters = &counters[cur_rank * num_steps];
-    uint64_t* prev_counters = (uint64_t*)(
-        (uintptr_t)&counters[prev_rank * num_steps] + prev_delta);
+    // Counter per channel per rank: counters[channel * world_size + rank]
+    uint64_t* my_counter = &counters[channel * world_size + cur_rank];
+    uint64_t* prev_counter = (uint64_t*)(
+        (uintptr_t)&counters[channel * world_size + prev_rank] + prev_delta);
 
-    int chunk_elems = shard_elements / NCHUNKS;
-    int chunk_vec = chunk_elems * (int)sizeof(bf16) / (int)sizeof(int4);
+    // This channel's portion of the shard
+    int ch_elems = shard_elements / num_channels;
+    int ch_off_bytes = channel * ch_elems * (int)sizeof(bf16);
+    int num_vec = ch_elems * (int)sizeof(bf16) / (int)sizeof(int4);
 
-    for (int step = 0; step < num_steps; step++) {
+    for (int step = 0; step < world_size - 1; step++) {
         int src_rank = (cur_rank - step + world_size) % world_size;
-        int shard_byte_off = src_rank * shard_elements * (int)sizeof(bf16);
+        int shard_off = src_rank * shard_elements * (int)sizeof(bf16);
 
-        for (int chunk = 0; chunk < NCHUNKS; chunk++) {
-            int chunk_byte_off = chunk * chunk_elems * (int)sizeof(bf16);
+        if (step == 0) {
+            // directSend: local a_shard → local a_local + next rank's a_local
+            const int4* src = reinterpret_cast<const int4*>((char*)a_shard_ptr + ch_off_bytes);
+            int4* dst_local = reinterpret_cast<int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
+            int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
 
-            if (step > 0) {
-                // Wait for prev rank's PREVIOUS step (step-1) to signal this chunk.
-                // Prev rank pushes data for our step S during its step S-1.
-                if (threadIdx.x == 0) {
-                    while (ld_flag(&prev_counters[step - 1]) < (uint64_t)(chunk + 1)) {
-                        __builtin_amdgcn_s_sleep(1);
-                    }
-                }
-                __syncthreads();
+            for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
+                int4 v = src[i];
+                dst_local[i] = v;
+                dst_next[i] = v;
             }
-
-            if (step == 0) {
-                // directSend: a_shard chunk → local a_local + next rank's a_local
-                const int4* src = reinterpret_cast<const int4*>(
-                    (char*)a_shard_ptr + chunk_byte_off);
-                int4* dst_local = reinterpret_cast<int4*>(
-                    (char*)a_local_ptr + shard_byte_off + chunk_byte_off);
-                int4* dst_next = reinterpret_cast<int4*>(
-                    (char*)next_a_local + shard_byte_off + chunk_byte_off);
-
-                for (int i = threadIdx.x; i < chunk_vec; i += PUSH_RING_THREADS) {
-                    int4 v = src[i];
-                    dst_local[i] = v;
-                    dst_next[i] = v;
+        } else {
+            // Wait for prev rank to have completed step-1 (which pushed the data we need)
+            if (threadIdx.x == 0) {
+                while (ld_flag(prev_counter) < (uint64_t)step) {
+                    __builtin_amdgcn_s_sleep(1);
                 }
-            } else if (step < num_steps - 1) {
-                // directRecvCopyDirectSend: local a_local → next rank's a_local
-                const int4* src = reinterpret_cast<const int4*>(
-                    (char*)a_local_ptr + shard_byte_off + chunk_byte_off);
-                int4* dst_next = reinterpret_cast<int4*>(
-                    (char*)next_a_local + shard_byte_off + chunk_byte_off);
+            }
+            __syncthreads();
 
-                for (int i = threadIdx.x; i < chunk_vec; i += PUSH_RING_THREADS) {
+            if (step < world_size - 2) {
+                // directRecvCopyDirectSend: read local a_local, forward to next
+                const int4* src = reinterpret_cast<const int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
+                int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
+                for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
                     dst_next[i] = src[i];
                 }
             }
-            // Last step: data already in a_local from prev push, no copy needed
+            // Last step: data already in a_local from prev rank's push
+        }
 
-            // Drain writes, then signal chunk done
-            fence_stores();
-            if (threadIdx.x == 0) {
-                st_flag(&my_counters[step], (uint64_t)(chunk + 1));
-            }
+        // Drain write buffer, then signal step done
+        fence_stores();
+        if (threadIdx.x == 0) {
+            st_flag(my_counter, (uint64_t)(step + 1));
         }
     }
 }
@@ -951,7 +942,7 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 1;  // single block, pipelining via NCHUNKS
+    int num_channels = 32;
 
     static bool printed = false;
     if (!printed) {
