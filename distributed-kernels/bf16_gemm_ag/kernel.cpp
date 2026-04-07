@@ -805,29 +805,34 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 }
 
 // ============================================================================
-// Push-Based Ring All-Gather (RCCL-style)
+// RCCL-Style Ring All-Gather via Iris
 //
-// Each rank pushes data to next rank's output buffer via iris XGMI writes.
-// Ring forwarding: receive from prev, copy locally, forward to next.
+// Multi-channel ring push: N independent channels (1 block each).
+// Each channel handles shard/N elements. Ring: push to next neighbor only.
+//
+// Sync: per-channel uint64_t step counters on iris heap (fine-grained).
+// - Counter writes: __builtin_nontemporal_store (bypass cache, instant vis)
+// - Counter reads: __atomic_load_n(..., __ATOMIC_RELAXED) (cheapest atomic)
+// - Data fence: __threadfence() (block-scope, NOT system-scope on gfx9)
+//   Fine-grained memory ensures stores are visible across XGMI without
+//   system-scope fences. RCCL does the same on gfx9.
 //
 // Layout: a_local[rank * shard_elements .. (rank+1) * shard_elements]
-//         a_local MUST be on iris heap for cross-GPU pointer translation.
+//         a_local and counters MUST be on iris heap.
 //
-// Sync: per-rank counters on iris heap. Counter[r] = number of chunks rank r
-//       has completed pushing for the current ring step. Next rank spin-waits
-//       on prev rank's counter.
-//
-// counters layout: counters[rank * world_size + step] = chunks completed
-//                  Total: world_size * world_size uint64_t values
+// counters[channel * world_size + rank] = step completed by rank for this channel
+// Total counters: num_channels * world_size uint64_t values
 // ============================================================================
 
 #define PUSH_RING_THREADS 512
-#define PUSH_RING_NSTEPS 1  // sub-chunks per shard for pipelining (1 = no pipelining)
 
-// Broadcast push: each rank pushes its own shard to ALL other ranks' a_local.
-// Ring-ordered destinations so at each step all GPUs write to unique targets.
-// a_local MUST be on iris heap for cross-GPU pointer translation.
-// Best iris AG approach so far: 148 GB/s (vs RCCL 400 GB/s)
+__device__ __forceinline__ void st_relaxed_sys(uint64_t* ptr, uint64_t val) {
+    __builtin_nontemporal_store(val, ptr);
+}
+
+__device__ __forceinline__ uint64_t ld_relaxed_sys(uint64_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_RELAXED);
+}
 
 __global__ __launch_bounds__(PUSH_RING_THREADS, 1)
 void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
@@ -835,26 +840,94 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
                          iris::iris_device_view iris_ctx,
                          int shard_elements, int world_size,
                          volatile uint64_t* __restrict__ counters,
-                         int num_blocks_total) {
+                         int num_channels) {
+    int channel = blockIdx.x;
+    if (channel >= num_channels) return;
+
     int cur_rank = iris_ctx.cur_rank();
     uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
 
-    int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
-    int global_stride = gridDim.x * PUSH_RING_THREADS;
-    int shard_bytes = shard_elements * sizeof(bf16);
-    int num_vec = shard_bytes / sizeof(int4);
+    int next_rank = (cur_rank + 1) % world_size;
+    int prev_rank = (cur_rank + world_size - 1) % world_size;
 
-    for (int step = 0; step < world_size; step++) {
-        int dst_rank = (cur_rank + step) % world_size;
+    // Pointer translation deltas (bytes)
+    uintptr_t next_base = iris_ctx.get_heap_base(next_rank);
+    uintptr_t prev_base = iris_ctx.get_heap_base(prev_rank);
+    intptr_t push_delta = (intptr_t)next_base - (intptr_t)local_base;
+    intptr_t prev_delta = (intptr_t)prev_base - (intptr_t)local_base;
 
-        uintptr_t dst_base = iris_ctx.get_heap_base(dst_rank);
-        intptr_t delta = (intptr_t)dst_base - (intptr_t)local_base;
-        int4* dst4 = reinterpret_cast<int4*>(
-            (uintptr_t)a_local_ptr + delta + cur_rank * shard_bytes);
-        const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
+    // Next rank's a_local for push writes
+    bf16* next_a_local = (bf16*)((uintptr_t)a_local_ptr + push_delta);
 
-        for (int i = global_tid; i < num_vec; i += global_stride) {
-            dst4[i] = src4[i];
+    // My step counter (local memory, written by me, read by next rank)
+    // counters[channel * world_size + rank]
+    uint64_t* my_step_ptr = const_cast<uint64_t*>(
+        &counters[channel * world_size + cur_rank]);
+
+    // Prev rank's step counter (translated to prev rank's address space)
+    uint64_t* prev_step_ptr = (uint64_t*)(
+        (uintptr_t)&counters[channel * world_size + prev_rank] + prev_delta);
+
+    // This channel's slice of the shard
+    int channel_elements = shard_elements / num_channels;
+    int channel_offset = channel * channel_elements;
+    int channel_bytes = channel_elements * sizeof(bf16);
+    int num_vec = channel_bytes / sizeof(int4);
+
+    // Ring: W-1 steps
+    for (int step = 0; step < world_size - 1; step++) {
+        // Which original rank's shard are we forwarding?
+        int src_rank = (cur_rank - step + world_size) % world_size;
+        int shard_byte_offset = src_rank * shard_elements * sizeof(bf16);
+
+        if (step == 0) {
+            // directSend: read local a_shard, write to local a_local + push to next
+            const int4* src4 = reinterpret_cast<const int4*>(
+                (char*)a_shard_ptr + channel_offset * sizeof(bf16));
+            int4* dst_local4 = reinterpret_cast<int4*>(
+                (char*)a_local_ptr + shard_byte_offset + channel_offset * sizeof(bf16));
+            int4* dst_next4 = reinterpret_cast<int4*>(
+                (char*)next_a_local + shard_byte_offset + channel_offset * sizeof(bf16));
+
+            for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
+                int4 val = src4[i];
+                dst_local4[i] = val;
+                dst_next4[i] = val;
+            }
+        } else {
+            // Wait for prev rank to finish previous step
+            // Only thread 0 spins; rest wait at __syncthreads
+            if (threadIdx.x == 0) {
+                uint64_t needed = step;  // prev rank's step counter >= step means done
+                while (ld_relaxed_sys(prev_step_ptr) < needed) {
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+            __syncthreads();
+
+            // Read from LOCAL a_local (prev rank pushed data here)
+            const int4* src4 = reinterpret_cast<const int4*>(
+                (char*)a_local_ptr + shard_byte_offset + channel_offset * sizeof(bf16));
+
+            if (step < world_size - 2) {
+                // directRecvCopyDirectSend: forward to next rank
+                int4* dst_next4 = reinterpret_cast<int4*>(
+                    (char*)next_a_local + shard_byte_offset + channel_offset * sizeof(bf16));
+                for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
+                    dst_next4[i] = src4[i];
+                }
+            }
+            // Last step (step == W-2): data already in a_local, nothing to push
+        }
+
+        // Block-scope fence (NOT system-scope): fine-grained memory
+        // ensures stores are visible across XGMI without __threadfence_system()
+        __threadfence();
+        __syncthreads();
+
+        // Signal completion: nontemporal store (bypasses cache, instant vis on fine-grained)
+        if (threadIdx.x == 0) {
+            st_relaxed_sys(my_step_ptr, (uint64_t)(step + 1));
         }
     }
 }
@@ -864,24 +937,21 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     volatile uint64_t* sync_counters = reinterpret_cast<volatile uint64_t*>(g.counters_ptr);
 
-    // Use all CUs for maximum bandwidth
-    int device_id;
-    hipGetDevice(&device_id);
-    hipDeviceProp_t props;
-    hipGetDeviceProperties(&props, device_id);
-    int num_blocks = props.multiProcessorCount;
+    // Multi-channel: each channel = 1 block. More channels = more XGMI saturation.
+    // RCCL uses 8-32 channels. Start with 32.
+    int num_channels = 32;
 
     static bool printed = false;
     if (!printed) {
-        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d blocks x %d threads, broadcast push\n",
-                shard_elements, num_blocks, PUSH_RING_THREADS);
+        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d channels x %d threads, ring push\n",
+                shard_elements, num_channels, PUSH_RING_THREADS);
         printed = true;
     }
 
-    ag_push_ring_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+    ag_push_ring_kernel<<<num_channels, PUSH_RING_THREADS, 0, g.stream>>>(
         g.a_shard.raw_ptr, g.a_local.raw_ptr,
         g.iris_ctx, shard_elements, g.world_size,
-        sync_counters, num_blocks);
+        sync_counters, num_channels);
 }
 
 // Push ring AG + standard TK GEMM (sequential, for comparison with RCCL+TK)
