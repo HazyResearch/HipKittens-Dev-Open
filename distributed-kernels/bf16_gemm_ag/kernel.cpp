@@ -104,8 +104,13 @@ void ag_gemm_persistent(ag_globals g) {
                 dst4[i] = src4[i];
             }
 
+            // ALL threads must finish their copy work before signaling.
+            // __syncthreads() ensures all threads in this block arrived.
+            // __threadfence() ensures all writes by ALL threads are visible
+            // to other blocks (device-scope fence).
+            __syncthreads();
+            __threadfence();
             if (threadIdx.x == 0) {
-                __threadfence();
                 __hip_atomic_fetch_add(&counters[r], 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
             }
         }
