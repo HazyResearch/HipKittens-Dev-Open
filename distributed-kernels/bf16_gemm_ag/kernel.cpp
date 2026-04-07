@@ -20,11 +20,10 @@ using G = kittens::group<NUM_PRODUCER_WORKERS>;
 using A_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 
-// Persistent fused AG-GEMM
-// ALL blocks do data movement first, then transition to GEMM via work queue.
-// Phase 1: every block cooperatively copies remote A → a_local (max bandwidth)
-// Phase 2: blocks grab GEMM tiles from atomic counter, compute, store, repeat
-// Accumulators in registers per tile — zero once, accumulate all ranks, store once.
+// Two-kernel approach:
+// 1. Lightweight copy kernel: all CUs copy remote A shards → a_local (max bandwidth)
+// 2. Persistent GEMM kernel: grab tiles from work queue, compute across all ranks
+// No spin-wait needed — stream ordering guarantees copy completes before GEMM starts.
 
 struct ag_globals {
     gl<bf16, -1, -1, -1, -1> a_shard;   // [M, K_local] on iris heap
@@ -38,7 +37,7 @@ struct ag_globals {
     int K;
     int K_local;
     int world_size;
-    uintptr_t counters_ptr;      // int[world_size] — per-rank copy-done counters
+    uintptr_t counters_ptr;      // unused in two-kernel approach (kept for API compat)
     uintptr_t work_counter_ptr;  // int — atomic GEMM tile counter
     int num_output_tiles;        // total GEMM tiles
 
@@ -47,17 +46,42 @@ struct ag_globals {
     __host__ __device__ int* counters() { return reinterpret_cast<int*>(counters_ptr); }
     __host__ __device__ int* work_counter() { return reinterpret_cast<int*>(work_counter_ptr); }
 
-    // No grid()/block() — dispatch computes persistent grid size
     size_t dynamic_shared_memory() { return 98304 + 16; } // +16 for scratch
 };
 
-// Spin on a single counter until >= target using atomic loads
-__device__ __forceinline__ void spin_until_ready(int* counter, int target) {
-    while (__hip_atomic_load(counter, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) {}
+// ============================================================================
+// Kernel 1: Copy all remote A shards → a_local using ALL CUs
+// ============================================================================
+#define COPY_THREADS 1024
+
+__global__ __launch_bounds__(COPY_THREADS, 1)
+void ag_copy_kernel(const bf16* __restrict__ a_shard_ptr,
+                    bf16* __restrict__ a_local_ptr,
+                    iris::iris_device_view iris_ctx,
+                    int shard_elements, int world_size) {
+    int cur_rank = iris_ctx.cur_rank();
+    uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
+
+    int global_tid = blockIdx.x * COPY_THREADS + threadIdx.x;
+    int global_stride = gridDim.x * COPY_THREADS;
+
+    for (int r = 0; r < world_size; r++) {
+        uintptr_t base_r = iris_ctx.get_heap_base(r);
+        intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
+        const int4* src4 = reinterpret_cast<const int4*>(
+            (uintptr_t)a_shard_ptr + delta);
+        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + r * shard_elements);
+        int num_vec = shard_elements / 8;
+
+        for (int i = global_tid; i < num_vec; i += global_stride) {
+            dst4[i] = src4[i];
+        }
+    }
 }
 
 // ============================================================================
-// Persistent fused kernel: all blocks copy, then all blocks compute
+// Kernel 2: Persistent GEMM — grab tiles from work queue
+// All data already in a_local, no spin-wait needed
 // ============================================================================
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void ag_gemm_persistent(ag_globals g) {
@@ -70,55 +94,10 @@ void ag_gemm_persistent(ag_globals g) {
     ST_A (&As)[2][M_BLOCK][2] = al.allocate<ST_A, 2, M_BLOCK, 2>();
     ST_B (&Bs)[2][N_BLOCK][2] = al.allocate<ST_B, 2, N_BLOCK, 2>();
 
-    // Scratch space after tile arrays for broadcasting tile_id
+    // Scratch space for broadcasting tile_id
     int* sh_tile_id = reinterpret_cast<int*>(reinterpret_cast<char*>(&__shm[0]) + 98304);
 
-    int total_blocks = gridDim.x;
-    int* counters = g.counters();
     int* work_ctr = g.work_counter();
-
-    // ════════════════════════════════════════════════════════
-    // Phase 1: ALL blocks cooperatively copy remote A → a_local
-    // Maximum XGMI bandwidth — every CU pulling data
-    // ════════════════════════════════════════════════════════
-    {
-        int shard_elements = g.M * g.K_local;
-        int cur_rank = g.iris_ctx.cur_rank();
-        uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
-
-        int global_tid = blockIdx.x * NUM_THREADS + threadIdx.x;
-        int global_stride = total_blocks * NUM_THREADS;
-
-        for (int r = 0; r < g.world_size; r++) {
-            uintptr_t base_r = g.iris_ctx.get_heap_base(r);
-            intptr_t delta = (intptr_t)base_r - (intptr_t)local_base;
-            const bf16* remote_a = reinterpret_cast<const bf16*>(
-                (uintptr_t)g.a_shard.raw_ptr + delta);
-            bf16* dst = g.a_local.raw_ptr + r * shard_elements;
-
-            const int4* src4 = reinterpret_cast<const int4*>(remote_a);
-            int4* dst4 = reinterpret_cast<int4*>(dst);
-            int num_vec = shard_elements / 8;
-
-            for (int i = global_tid; i < num_vec; i += global_stride) {
-                dst4[i] = src4[i];
-            }
-
-            // ALL threads must finish their copy work before signaling.
-            // __syncthreads() ensures all threads in this block arrived.
-            // __threadfence() ensures all writes by ALL threads are visible
-            // to other blocks (device-scope fence).
-            __syncthreads();
-            __threadfence();
-            if (threadIdx.x == 0) {
-                __hip_atomic_fetch_add(&counters[r], 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    // Phase 2: Persistent GEMM — grab tiles from work queue
-    // ════════════════════════════════════════════════════════
 
     int warp_id = kittens::warpid();
     int local_warp_id = warp_id % 4;
@@ -145,7 +124,7 @@ void ag_gemm_persistent(ag_globals g) {
     const int num_pid_n = ceil_div(g.N, NEW_COL_BLOCK_SIZE);
     const int WGM = 4;
 
-    // Accumulators — declared outside loop to reduce register pressure
+    // Accumulators
     rt_fl<HALF_BLOCK_SIZE, HALF_BLOCK_SIZE, col_l, rt_16x16_s> C_accum[2][2];
 
     // ── Persistent tile loop ──
@@ -156,7 +135,7 @@ void ag_gemm_persistent(ag_globals g) {
         }
         __syncthreads();
         int tile_id = *sh_tile_id;
-        __syncthreads();  // prevent sh_tile_id overwrite race on next iteration
+        __syncthreads();
 
         if (tile_id >= g.num_output_tiles) break;
 
@@ -183,13 +162,7 @@ void ag_gemm_persistent(ag_globals g) {
 
         // Process all ranks for this output tile
         for (int rank = 0; rank < g.world_size; rank++) {
-            // Spin until this rank's data is fully copied
-            if (threadIdx.x == 0) {
-                spin_until_ready(&counters[rank], total_blocks);
-            }
-            __syncthreads();
-
-            // Point a_gl to this rank's section
+            // Point a_gl to this rank's section (data already in a_local)
             a_gl.raw_ptr = g.a_local.raw_ptr + rank * shard_elements;
 
             int tic = 0, toc = 1;
@@ -291,7 +264,7 @@ void ag_gemm_persistent(ag_globals g) {
             }
         }
 
-        // Store C for this tile — single write
+        // Store C for this tile — single write across all ranks
         if (is_consumer) {
             store(g.c, C_accum[0][0], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 0});
             store(g.c, C_accum[0][1], {0, 0, (row + consumer_idx) * 2 + 0, col * 2 + local_warp_id * 2 + 1});
@@ -302,41 +275,54 @@ void ag_gemm_persistent(ag_globals g) {
 }
 
 void dispatch_ag_gemm(ag_globals g) {
-    const unsigned long mem_size = g.dynamic_shared_memory();
-    hipFuncSetAttribute((void*)ag_gemm_persistent,
-                        hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    int shard_elements = g.M * g.K_local;
 
-    // Query max occupancy to determine persistent grid size
-    int max_blocks_per_cu;
-    hipOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_cu, (void*)ag_gemm_persistent, NUM_THREADS, mem_size);
+    // ── Phase 1: Copy kernel (lean, no register spills) ──
+    {
+        int device_id;
+        hipGetDevice(&device_id);
+        hipDeviceProp_t props;
+        hipGetDeviceProperties(&props, device_id);
+        int num_cus = props.multiProcessorCount;
 
-    int device_id;
-    hipGetDevice(&device_id);
-    hipDeviceProp_t props;
-    hipGetDeviceProperties(&props, device_id);
-    int num_cus = props.multiProcessorCount;
-
-    int total_blocks = max_blocks_per_cu * num_cus;
-
-    // Scratch memory (196 bytes/lane) prevents full 256-block occupancy.
-    // Cap at 128 blocks — enough CUs for overlap, avoids deadlock.
-    if (total_blocks > 128) total_blocks = 128;
-
-    // Print debug info (remove later)
-    static bool printed = false;
-    if (!printed) {
-        fprintf(stderr, "[ag_gemm] CUs=%d, max_blocks_per_cu=%d, total_blocks=%d, output_tiles=%d\n",
-                num_cus, max_blocks_per_cu, total_blocks, g.num_output_tiles);
-        printed = true;
+        // Launch with max CUs — copy kernel is lightweight
+        int copy_blocks = num_cus;  // 256 blocks, 1 per CU
+        ag_copy_kernel<<<copy_blocks, COPY_THREADS, 0, g.stream>>>(
+            g.a_shard.raw_ptr, g.a_local.raw_ptr,
+            g.iris_ctx, shard_elements, g.world_size);
     }
 
-    // Zero counters + work counter
-    hipMemsetAsync(g.counters(), 0, g.world_size * sizeof(int), g.stream);
-    hipMemsetAsync(g.work_counter(), 0, sizeof(int), g.stream);
+    // ── Phase 2: Persistent GEMM (stream ordering ensures copy is done) ──
+    {
+        const unsigned long mem_size = g.dynamic_shared_memory();
+        hipFuncSetAttribute((void*)ag_gemm_persistent,
+                            hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-    // Single persistent launch — all blocks copy, then all blocks compute
-    ag_gemm_persistent<<<total_blocks, NUM_THREADS, mem_size, g.stream>>>(g);
+        int max_blocks_per_cu;
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_cu, (void*)ag_gemm_persistent, NUM_THREADS, mem_size);
+
+        int device_id;
+        hipGetDevice(&device_id);
+        hipDeviceProp_t props;
+        hipGetDeviceProperties(&props, device_id);
+        int num_cus = props.multiProcessorCount;
+
+        int total_blocks = max_blocks_per_cu * num_cus;
+        if (total_blocks > g.num_output_tiles) total_blocks = g.num_output_tiles;
+
+        static bool printed = false;
+        if (!printed) {
+            fprintf(stderr, "[ag_gemm] CUs=%d, max_blocks_per_cu=%d, gemm_blocks=%d, output_tiles=%d\n",
+                    num_cus, max_blocks_per_cu, total_blocks, g.num_output_tiles);
+            printed = true;
+        }
+
+        // Zero work counter
+        hipMemsetAsync(g.work_counter(), 0, sizeof(int), g.stream);
+
+        ag_gemm_persistent<<<total_blocks, NUM_THREADS, mem_size, g.stream>>>(g);
+    }
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
