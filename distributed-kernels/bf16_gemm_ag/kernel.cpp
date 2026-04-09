@@ -821,24 +821,41 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 //         a_local and counters MUST be on iris heap.
 // ============================================================================
 
-#define PUSH_RING_THREADS 1024
+// ============================================================================
+// RCCL-exact Ring All-Gather
+//
+// Matches RCCL's architecture:
+// - 16 channels (blocks), 512 threads (8 warps of 64) per block
+// - Thread role specialization: thread 0 = wait/poll, last thread = post/signal
+//   Middle threads = data copy workers
+// - skip_fence path: s_waitcnt vmcnt(0) + intra-block barrier (no threadfence)
+// - Counter: __atomic_store_n / __atomic_load_n with RELAXED on gfx9
+// - DirectWrite: sender writes directly into receiver's output buffer
+// - 16-byte (int4) vector copies
+// ============================================================================
 
-__device__ __forceinline__ void st_flag(uint64_t* ptr, uint64_t val) {
-    __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#define AG_NTHREADS 512
+#define AG_NCHANNELS 16
+
+// Counter helpers (RCCL's exact pattern on gfx9)
+__device__ __forceinline__ void ag_st_flag(uint64_t* ptr, uint64_t val) {
+    __atomic_store_n(ptr, val, __ATOMIC_RELAXED);
 }
 
-__device__ __forceinline__ uint64_t ld_flag(uint64_t* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+__device__ __forceinline__ uint64_t ag_ld_flag(uint64_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_RELAXED);
 }
 
-__device__ __forceinline__ void fence_stores() {
-    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+// RCCL skip_fence: signal fence + s_waitcnt + block barrier
+// This is cheaper than __threadfence() which does cache invalidation
+__device__ __forceinline__ void ag_skip_fence(int nthreads) {
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)" ::: "memory");
+    __syncthreads();  // intra-block barrier (RCCL uses a custom one, __syncthreads is equivalent)
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
-// Multi-channel ring push all-gather
-// Each channel = 1 block processing shard/num_channels elements.
-// One counter per channel per rank: counters[channel * world_size + rank]
-__global__ __launch_bounds__(PUSH_RING_THREADS, 1)
+__global__ __launch_bounds__(AG_NTHREADS, 1)
 void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
                          bf16* __restrict__ a_local_ptr,
                          iris::iris_device_view iris_ctx,
@@ -859,48 +876,70 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
 
     bf16* next_a_local = (bf16*)((uintptr_t)a_local_ptr + push_delta);
 
+    // Counter layout: counters[channel * world_size + rank]
+    // my_counter lives on THIS rank's heap (sender writes here)
+    // prev_counter is on PREV rank's heap (we read it remotely via XGMI)
     uint64_t* my_counter = &counters[channel * world_size + cur_rank];
     uint64_t* prev_counter = (uint64_t*)(
         (uintptr_t)&counters[channel * world_size + prev_rank] + prev_delta);
 
+    // This channel's slice of the shard
     int ch_elems = shard_elements / num_channels;
     int ch_off_bytes = channel * ch_elems * (int)sizeof(bf16);
     int num_vec = ch_elems * (int)sizeof(bf16) / (int)sizeof(int4);
+
+    // Thread roles (RCCL pattern):
+    // Thread 0: polls prev rank's counter (RoleWaitRecv)
+    // Last thread: signals completion (RolePostSend)
+    // All threads: data copy workers (all participate in copy)
 
     for (int step = 0; step < world_size - 1; step++) {
         int src_rank = (cur_rank - step + world_size) % world_size;
         int shard_off = src_rank * shard_elements * (int)sizeof(bf16);
 
+        // === WAIT PHASE ===
+        // Step 0: no wait needed (sending own data)
+        // Step 1+: wait for prev rank to have completed step-1
+        if (step > 0) {
+            // Only thread 0 polls (like RCCL's RoleWaitRecv)
+            if (threadIdx.x == 0) {
+                uint64_t cache = ag_ld_flag(prev_counter);
+                while (cache < (uint64_t)step) {
+                    __builtin_amdgcn_s_sleep(1);
+                    cache = ag_ld_flag(prev_counter);
+                }
+            }
+            __syncthreads();  // all threads wait for thread 0
+        }
+
+        // === COPY PHASE ===
         if (step == 0) {
+            // directCopySend: own shard → local a_local + next rank's a_local
             const int4* src = reinterpret_cast<const int4*>((char*)a_shard_ptr + ch_off_bytes);
             int4* dst_local = reinterpret_cast<int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
             int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
 
-            for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
+            for (int i = threadIdx.x; i < num_vec; i += AG_NTHREADS) {
                 int4 v = src[i];
                 dst_local[i] = v;
                 dst_next[i] = v;
             }
-        } else {
-            if (threadIdx.x == 0) {
-                while (ld_flag(prev_counter) < (uint64_t)step) {
-                    __builtin_amdgcn_s_sleep(1);
-                }
-            }
-            __syncthreads();
-
-            if (step < world_size - 2) {
-                const int4* src = reinterpret_cast<const int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
-                int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
-                for (int i = threadIdx.x; i < num_vec; i += PUSH_RING_THREADS) {
-                    dst_next[i] = src[i];
-                }
+        } else if (step < world_size - 2) {
+            // directRecvCopyDirectSend: local a_local → next rank's a_local
+            const int4* src = reinterpret_cast<const int4*>((char*)a_local_ptr + shard_off + ch_off_bytes);
+            int4* dst_next  = reinterpret_cast<int4*>((char*)next_a_local + shard_off + ch_off_bytes);
+            for (int i = threadIdx.x; i < num_vec; i += AG_NTHREADS) {
+                dst_next[i] = src[i];
             }
         }
+        // Last step: directRecv — data is already in a_local from prev push
 
-        fence_stores();
-        if (threadIdx.x == 0) {
-            st_flag(my_counter, (uint64_t)(step + 1));
+        // === POST PHASE (skip_fence + signal) ===
+        ag_skip_fence(AG_NTHREADS);
+
+        // Only the designated "post" thread signals
+        if (threadIdx.x == AG_NTHREADS - 1) {
+            ag_st_flag(my_counter, (uint64_t)(step + 1));
         }
     }
 }
@@ -908,12 +947,12 @@ void ag_push_ring_kernel(bf16* __restrict__ a_shard_ptr,
 // ── Single-step ring copy kernel (for host-side ring dispatch) ──
 // Copies one shard slice from local → next rank's a_local
 // No sync — host manages step ordering via stream + barriers
-__global__ __launch_bounds__(PUSH_RING_THREADS, 1)
+__global__ __launch_bounds__(AG_NTHREADS, 1)
 void ag_ring_step_kernel(bf16* __restrict__ src_ptr,
                          bf16* __restrict__ dst_ptr,
                          int num_elements) {
-    int global_tid = blockIdx.x * PUSH_RING_THREADS + threadIdx.x;
-    int global_stride = gridDim.x * PUSH_RING_THREADS;
+    int global_tid = blockIdx.x * AG_NTHREADS + threadIdx.x;
+    int global_stride = gridDim.x * AG_NTHREADS;
     int num_vec = num_elements * (int)sizeof(bf16) / (int)sizeof(int4);
     const int4* src4 = reinterpret_cast<const int4*>(src_ptr);
     int4* dst4 = reinterpret_cast<int4*>(dst_ptr);
@@ -928,16 +967,16 @@ void dispatch_push_ring_ag(ag_globals g) {
 
     uint64_t* sync_counters = reinterpret_cast<uint64_t*>(g.counters_ptr);
 
-    int num_channels = 2;
+    int num_channels = AG_NCHANNELS;
 
     static bool printed = false;
     if (!printed) {
-        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d channels x %d threads, ring push (s_waitcnt)\n",
-                shard_elements, num_channels, PUSH_RING_THREADS);
+        fprintf(stderr, "[push_ring_ag] shard=%d elements, %d channels x %d threads, RCCL-style ring\n",
+                shard_elements, num_channels, AG_NTHREADS);
         printed = true;
     }
 
-    ag_push_ring_kernel<<<num_channels, PUSH_RING_THREADS, 0, g.stream>>>(
+    ag_push_ring_kernel<<<num_channels, AG_NTHREADS, 0, g.stream>>>(
         g.a_shard.raw_ptr, g.a_local.raw_ptr,
         g.iris_ctx, shard_elements, g.world_size,
         sync_counters, num_channels);
@@ -964,18 +1003,18 @@ void dispatch_push_ring_step(ag_globals g) {
 
     if (step == 0) {
         // Copy own shard to local a_local slot
-        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+        ag_ring_step_kernel<<<num_blocks, AG_NTHREADS, 0, g.stream>>>(
             g.a_shard.raw_ptr,
             g.a_local.raw_ptr + src_rank * shard_elements,
             shard_elements);
         // Push own shard to next rank's a_local slot
-        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+        ag_ring_step_kernel<<<num_blocks, AG_NTHREADS, 0, g.stream>>>(
             g.a_shard.raw_ptr,
             next_a_local + src_rank * shard_elements,
             shard_elements);
     } else if (step < g.world_size - 2) {
         // Forward: read from local a_local (where prev rank pushed), push to next
-        ag_ring_step_kernel<<<num_blocks, PUSH_RING_THREADS, 0, g.stream>>>(
+        ag_ring_step_kernel<<<num_blocks, AG_NTHREADS, 0, g.stream>>>(
             g.a_local.raw_ptr + src_rank * shard_elements,
             next_a_local + src_rank * shard_elements,
             shard_elements);
