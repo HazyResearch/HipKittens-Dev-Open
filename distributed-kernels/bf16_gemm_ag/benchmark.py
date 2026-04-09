@@ -117,6 +117,25 @@ for M, K, N in configs:
                                               iris_device_ctx, M, N, K, K_local, world_size,
                                               counters_ptr, work_ptr, num_output_tiles)
 
+    def call_direct_pull_ag():
+        tk_kernel.dispatch_direct_pull_ag(A_shard_iris, A_local, B, C,
+                                           iris_device_ctx, M, N, K, K_local, world_size,
+                                           counters_ptr, work_ptr, num_output_tiles)
+
+    def call_direct_push_ag():
+        tk_kernel.dispatch_direct_push_ag(A_shard_iris, A_local, B, C,
+                                            iris_device_ctx, M, N, K, K_local, world_size,
+                                            counters_ptr, work_ptr, num_output_tiles)
+
+    # Cached push: read from regular CUDA memory (not fine-grained iris heap)
+    A_shard_cached = A_shard_iris.clone()  # regular CUDA tensor
+    A_shard_cached.copy_(A_shard_iris)
+    cached_ptr = A_shard_cached.data_ptr()
+    def call_direct_push_cached_ag():
+        tk_kernel.dispatch_direct_push_cached_ag(A_shard_iris, A_local, B, C,
+                                                   iris_device_ctx, M, N, K, K_local, world_size,
+                                                   counters_ptr, cached_ptr, num_output_tiles)
+
     def call_push_ring_ag():
         sync_counters.zero_()
         tk_kernel.dispatch_push_ring_ag(A_shard_iris, A_local, B, C,
@@ -137,6 +156,11 @@ for M, K, N in configs:
         tk_kernel.dispatch_push_ring_ag_gemm(A_shard_iris, A_local, B, C,
                                               iris_device_ctx, M, N, K, K_local, world_size,
                                               sync_counters_ptr, work_ptr, num_output_tiles)
+
+    def call_direct_push_ag_gemm():
+        tk_kernel.dispatch_direct_push_ag_gemm(A_shard_iris, A_local, B, C,
+                                                iris_device_ctx, M, N, K, K_local, world_size,
+                                                counters_ptr, work_ptr, num_output_tiles)
 
     def call_rccl_ag():
         dist.all_gather_into_tensor(A_local, A_shard_torch)
@@ -194,8 +218,45 @@ for M, K, N in configs:
     # In-kernel push ring AG
     push_ring_ag_ms = time_fn(call_push_ring_ag, "iris_push_ring_ag")
 
+    # Direct parallel AG (all XGMI links simultaneously)
+    direct_pull_ms = time_fn(call_direct_pull_ag, "iris_direct_pull")
+    direct_push_ms = time_fn(call_direct_push_ag, "iris_direct_push")
+    direct_push_cached_ms = time_fn(call_direct_push_cached_ag, "iris_direct_push_cached")
+
+    # hipMemcpyAsync-based push
+    def call_memcpy_push_ag():
+        tk_kernel.dispatch_memcpy_push_ag(A_shard_iris, A_local, B, C,
+                                           iris_device_ctx, M, N, K, K_local, world_size,
+                                           counters_ptr, work_ptr, num_output_tiles)
+    memcpy_push_ms = time_fn(call_memcpy_push_ag, "iris_memcpy_push")
+
+    # Sweep blocks_per_rank for push
+    def call_push_8():
+        tk_kernel.dispatch_direct_push_ag_8(A_shard_iris, A_local, B, C,
+                                             iris_device_ctx, M, N, K, K_local, world_size,
+                                             counters_ptr, work_ptr, num_output_tiles)
+    def call_push_16():
+        tk_kernel.dispatch_direct_push_ag_16(A_shard_iris, A_local, B, C,
+                                              iris_device_ctx, M, N, K, K_local, world_size,
+                                              counters_ptr, work_ptr, num_output_tiles)
+    def call_push_64():
+        tk_kernel.dispatch_direct_push_ag_64(A_shard_iris, A_local, B, C,
+                                              iris_device_ctx, M, N, K, K_local, world_size,
+                                              counters_ptr, work_ptr, num_output_tiles)
+    def call_push_128():
+        tk_kernel.dispatch_direct_push_ag_128(A_shard_iris, A_local, B, C,
+                                               iris_device_ctx, M, N, K, K_local, world_size,
+                                               counters_ptr, work_ptr, num_output_tiles)
+    push_8_ms = time_fn(call_push_8, "iris_push_8")
+    push_16_ms = time_fn(call_push_16, "iris_push_16")
+    push_64_ms = time_fn(call_push_64, "iris_push_64")
+    push_128_ms = time_fn(call_push_128, "iris_push_128")
+
     # Push ring AG + TK GEMM
     push_ring_ag_gemm_ms = time_fn(call_push_ring_ag_gemm, "iris_push_ring_ag_gemm")
+
+    # Direct push AG + TK GEMM (best combo)
+    direct_push_ag_gemm_ms = time_fn(call_direct_push_ag_gemm, "iris_direct_push_gemm")
 
     # RCCL-based
     rccl_ag_ms = time_fn(call_rccl_ag, "rccl_ag")
@@ -240,6 +301,17 @@ for M, K, N in configs:
         push_bw = total_bytes/1e9/(push_ring_ag_ms*1e-3)
         print(f"  {'Iris host ring AG (barrier)':<35s}  {host_ring_ag_ms:10.3f}  {host_ring_bw:7.0f} GB/s")
         print(f"  {'Iris push ring AG (in-kernel)':<35s}  {push_ring_ag_ms:10.3f}  {push_bw:7.0f} GB/s")
+        direct_pull_bw = total_bytes/1e9/(direct_pull_ms*1e-3)
+        direct_push_bw = total_bytes/1e9/(direct_push_ms*1e-3)
+        print(f"  {'Iris direct pull AG (parallel)':<35s}  {direct_pull_ms:10.3f}  {direct_pull_bw:7.0f} GB/s")
+        print(f"  {'Iris direct push AG (32 blk/r)':<35s}  {direct_push_ms:10.3f}  {direct_push_bw:7.0f} GB/s")
+        cached_bw = total_bytes/1e9/(direct_push_cached_ms*1e-3)
+        print(f"  {'Iris push cached (64 blk/r)':<35s}  {direct_push_cached_ms:10.3f}  {cached_bw:7.0f} GB/s")
+        memcpy_push_bw = total_bytes/1e9/(memcpy_push_ms*1e-3)
+        print(f"  {'Iris hipMemcpyAsync push':<35s}  {memcpy_push_ms:10.3f}  {memcpy_push_bw:7.0f} GB/s")
+        for bpr, ms in [(8, push_8_ms), (16, push_16_ms), (64, push_64_ms), (128, push_128_ms)]:
+            bw = total_bytes/1e9/(ms*1e-3)
+            print(f"  {'Iris direct push AG (%d blk/r)' % bpr:<35s}  {ms:10.3f}  {bw:7.0f} GB/s")
         print(f"  {'RCCL all_gather_into_tensor':<35s}  {rccl_ag_ms:10.3f}  {rccl_bw:7.0f} GB/s")
         print(f"  {'TK GEMM only':<35s}  {gemm_ms:10.3f}  {flops/(gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'rocBLAS matmul only':<35s}  {rocblas_ms:10.3f}  {flops/(rocblas_ms*1e-3)/1e12:8.1f}")
@@ -248,6 +320,7 @@ for M, K, N in configs:
         print(f"  {'Iris fused AG-GEMM (ring)':<35s}  {fused_iris_ms:10.3f}  {flops/(fused_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris pipelined (copy||GEMM)':<35s}  {pipelined_iris_ms:10.3f}  {flops/(pipelined_iris_ms*1e-3)/1e12:8.1f}")
         print(f"  {'Iris host ring AG + TK GEMM':<35s}  {host_ring_ag_ms + gemm_ms:10.3f}  {flops/((host_ring_ag_ms + gemm_ms)*1e-3)/1e12:8.1f}")
+        print(f"  {'Iris direct push AG + TK GEMM':<35s}  {direct_push_ag_gemm_ms:10.3f}  {flops/(direct_push_ag_gemm_ms*1e-3)/1e12:8.1f}")
         print(f"  {'RCCL AG + TK GEMM':<35s}  {rccl_tk_ms:10.3f}  {flops/(rccl_tk_ms*1e-3)/1e12:8.1f}")
         print(f"  {'torch AG + rocBLAS (baseline)':<35s}  {torch_ms:10.3f}  {flops/(torch_ms*1e-3)/1e12:8.1f}")
         print(f"  {'-'*58}")

@@ -805,21 +805,247 @@ void dispatch_pipelined_ag_gemm(ag_globals g) {
 }
 
 // ============================================================================
-// RCCL-Style Ring All-Gather via Iris
+// Parallel Direct All-Gather: read from ALL remote ranks simultaneously
 //
-// Multi-channel ring push: N independent channels (1 block each).
-// Each channel handles shard/N elements. Ring: push to next neighbor only.
+// Instead of ring (1 link at a time), uses the fully-connected XGMI mesh:
+// each block handles a chunk of ONE source rank's shard, and all ranks'
+// blocks run concurrently → all 7 XGMI links saturated simultaneously.
 //
-// Sync matches RCCL's skip_fence path (gfx9 fine-grained memory):
-// - Data ordering: s_waitcnt vmcnt(0) — drain write buffer, NO cache flush
-// - Counter writes: __builtin_nontemporal_store (bypass cache, instant vis)
-// - Counter reads: __builtin_nontemporal_load (bypass cache)
-// - NO __threadfence() or __threadfence_system() in hot loop
-//   Fine-grained memory = stores visible across XGMI once write buffer drains
-//
-// Layout: a_local[rank * shard_elements .. (rank+1) * shard_elements]
-//         a_local and counters MUST be on iris heap.
+// Grid: (world_size * blocks_per_rank) blocks
+// Each block: reads from one remote rank's a_shard, writes to local a_local
 // ============================================================================
+
+#define DIRECT_AG_THREADS 512
+
+// Pull version: each GPU reads from all remote shards simultaneously
+__global__ __launch_bounds__(DIRECT_AG_THREADS, 1)
+void ag_direct_pull_kernel(const bf16* __restrict__ a_shard_ptr,
+                           bf16* __restrict__ a_local_ptr,
+                           iris::iris_device_view iris_ctx,
+                           int shard_elements, int world_size,
+                           int blocks_per_rank) {
+    int rank_idx = blockIdx.x / blocks_per_rank;  // which source rank
+    int block_in_rank = blockIdx.x % blocks_per_rank;  // which chunk within that rank
+    if (rank_idx >= world_size) return;
+
+    int cur_rank = iris_ctx.cur_rank();
+    uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
+    int src_rank = (cur_rank + rank_idx) % world_size;  // ring-ordered to reduce contention
+
+    uintptr_t src_base = iris_ctx.get_heap_base(src_rank);
+    intptr_t delta = (intptr_t)src_base - (intptr_t)local_base;
+
+    const int4* src4 = reinterpret_cast<const int4*>((uintptr_t)a_shard_ptr + delta);
+    int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + src_rank * shard_elements);
+    int num_vec = shard_elements * (int)sizeof(bf16) / (int)sizeof(int4);
+
+    int tid = block_in_rank * DIRECT_AG_THREADS + threadIdx.x;
+    int stride = blocks_per_rank * DIRECT_AG_THREADS;
+
+    for (int i = tid; i < num_vec; i += stride) {
+        dst4[i] = src4[i];
+    }
+}
+
+// Push from regular CUDA memory: reads cached shard, writes to remote iris heap
+__global__ __launch_bounds__(DIRECT_AG_THREADS, 1)
+void ag_direct_push_cached_kernel(const bf16* __restrict__ a_shard_cached,
+                                  bf16* __restrict__ a_local_ptr,
+                                  iris::iris_device_view iris_ctx,
+                                  int shard_elements, int world_size,
+                                  int blocks_per_rank) {
+    int rank_idx = blockIdx.x / blocks_per_rank;
+    int block_in_rank = blockIdx.x % blocks_per_rank;
+    if (rank_idx >= world_size) return;
+
+    int cur_rank = iris_ctx.cur_rank();
+    uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
+    int num_vec = shard_elements * (int)sizeof(bf16) / (int)sizeof(int4);
+    const int4* src4 = reinterpret_cast<const int4*>(a_shard_cached);
+
+    int tid = block_in_rank * DIRECT_AG_THREADS + threadIdx.x;
+    int stride = blocks_per_rank * DIRECT_AG_THREADS;
+
+    if (rank_idx == 0) {
+        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + cur_rank * shard_elements);
+        for (int i = tid; i < num_vec; i += stride) {
+            dst4[i] = src4[i];
+        }
+    } else {
+        int dst_rank = (cur_rank + rank_idx) % world_size;
+        uintptr_t dst_base = iris_ctx.get_heap_base(dst_rank);
+        intptr_t delta = (intptr_t)dst_base - (intptr_t)local_base;
+        bf16* remote_a_local = (bf16*)((uintptr_t)a_local_ptr + delta);
+        int4* dst4 = reinterpret_cast<int4*>(remote_a_local + cur_rank * shard_elements);
+        for (int i = tid; i < num_vec; i += stride) {
+            dst4[i] = src4[i];
+        }
+    }
+}
+
+// Push version: each GPU writes its own shard to all remote ranks simultaneously
+__global__ __launch_bounds__(DIRECT_AG_THREADS, 1)
+void ag_direct_push_kernel(const bf16* __restrict__ a_shard_ptr,
+                           bf16* __restrict__ a_local_ptr,
+                           iris::iris_device_view iris_ctx,
+                           int shard_elements, int world_size,
+                           int blocks_per_rank) {
+    int rank_idx = blockIdx.x / blocks_per_rank;  // which dest rank
+    int block_in_rank = blockIdx.x % blocks_per_rank;
+    if (rank_idx >= world_size) return;
+
+    int cur_rank = iris_ctx.cur_rank();
+    uintptr_t local_base = iris_ctx.get_heap_base(cur_rank);
+
+    // Read from own shard (local HBM), write to dest's a_local
+    const int4* src4 = reinterpret_cast<const int4*>(a_shard_ptr);
+    int num_vec = shard_elements * (int)sizeof(bf16) / (int)sizeof(int4);
+
+    if (rank_idx == 0) {
+        // Local: write to own a_local slot
+        int4* dst4 = reinterpret_cast<int4*>(a_local_ptr + cur_rank * shard_elements);
+        int tid = block_in_rank * DIRECT_AG_THREADS + threadIdx.x;
+        int stride = blocks_per_rank * DIRECT_AG_THREADS;
+        for (int i = tid; i < num_vec; i += stride) {
+            dst4[i] = src4[i];
+        }
+    } else {
+        // Remote: write to dest rank's a_local via XGMI
+        int dst_rank = (cur_rank + rank_idx) % world_size;
+        uintptr_t dst_base = iris_ctx.get_heap_base(dst_rank);
+        intptr_t delta = (intptr_t)dst_base - (intptr_t)local_base;
+        int4* dst4 = reinterpret_cast<int4*>(
+            (uintptr_t)a_local_ptr + delta + cur_rank * shard_elements * (int)sizeof(bf16));
+        // dst4 points to dst_rank's a_local[cur_rank * shard_elements]
+        // Recalculate properly: a_local_ptr + delta is remote a_local base
+        bf16* remote_a_local = (bf16*)((uintptr_t)a_local_ptr + delta);
+        dst4 = reinterpret_cast<int4*>(remote_a_local + cur_rank * shard_elements);
+
+        int tid = block_in_rank * DIRECT_AG_THREADS + threadIdx.x;
+        int stride = blocks_per_rank * DIRECT_AG_THREADS;
+        for (int i = tid; i < num_vec; i += stride) {
+            dst4[i] = src4[i];
+        }
+    }
+}
+
+void dispatch_direct_pull_ag(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 32;  // 32 blocks per source rank, 8 ranks = 256 blocks total
+    int total_blocks = g.world_size * blocks_per_rank;
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[direct_pull_ag] shard=%d elements, %d blocks/rank, %d total blocks\n",
+                shard_elements, blocks_per_rank, total_blocks);
+        printed = true;
+    }
+
+    ag_direct_pull_kernel<<<total_blocks, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+
+void dispatch_direct_push_ag(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+
+    // Use num_output_tiles to pass blocks_per_rank from Python (default 32)
+    // Actually just sweep here
+    int blocks_per_rank = 32;
+    int total_blocks = g.world_size * blocks_per_rank;
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[direct_push_ag] shard=%d elements, %d blocks/rank, %d total blocks\n",
+                shard_elements, blocks_per_rank, total_blocks);
+        printed = true;
+    }
+
+    ag_direct_push_kernel<<<total_blocks, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+
+// Push from regular CUDA memory (tests if fine-grained reads are the bottleneck)
+// Allocates a cached copy of a_shard on regular CUDA memory (hipMalloc), copies to it,
+// then pushes from there. work_counter_ptr is repurposed as the cached buffer pointer.
+void dispatch_direct_push_cached_ag(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 64;
+    int total_blocks = g.world_size * blocks_per_rank;
+
+    // Use work_counter_ptr as cached shard buffer (allocated in Python as regular CUDA tensor)
+    bf16* cached_shard = reinterpret_cast<bf16*>(g.work_counter_ptr);
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[direct_push_cached_ag] shard=%d elements, reading from regular CUDA memory\n",
+                shard_elements);
+        printed = true;
+    }
+
+    ag_direct_push_cached_kernel<<<total_blocks, DIRECT_AG_THREADS, 0, g.stream>>>(
+        cached_shard, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+
+// hipMemcpyAsync-based AG: use runtime memcpy instead of kernel writes
+void dispatch_memcpy_push_ag(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int shard_bytes = shard_elements * sizeof(bf16);
+    int cur_rank = g.iris_ctx.cur_rank();
+    uintptr_t local_base = g.iris_ctx.get_heap_base(cur_rank);
+
+    static bool printed = false;
+    if (!printed) {
+        fprintf(stderr, "[memcpy_push_ag] shard=%d bytes, using hipMemcpyAsync to all peers\n",
+                shard_bytes);
+        printed = true;
+    }
+
+    for (int r = 0; r < g.world_size; r++) {
+        bf16* dst;
+        if (r == cur_rank) {
+            dst = g.a_local.raw_ptr + cur_rank * shard_elements;
+        } else {
+            intptr_t delta = (intptr_t)g.iris_ctx.get_heap_base(r) - (intptr_t)local_base;
+            bf16* remote_a_local = (bf16*)((uintptr_t)g.a_local.raw_ptr + delta);
+            dst = remote_a_local + cur_rank * shard_elements;
+        }
+        hipMemcpyAsync(dst, g.a_shard.raw_ptr, shard_bytes,
+                       hipMemcpyDeviceToDevice, g.stream);
+    }
+}
+
+// Variants with different blocks_per_rank
+void dispatch_direct_push_ag_8(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 8;
+    ag_direct_push_kernel<<<g.world_size * blocks_per_rank, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+void dispatch_direct_push_ag_16(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 16;
+    ag_direct_push_kernel<<<g.world_size * blocks_per_rank, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+void dispatch_direct_push_ag_64(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 64;
+    ag_direct_push_kernel<<<g.world_size * blocks_per_rank, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
+void dispatch_direct_push_ag_128(ag_globals g) {
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 128;
+    ag_direct_push_kernel<<<g.world_size * blocks_per_rank, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+}
 
 // ============================================================================
 // RCCL-exact Ring All-Gather
@@ -1032,6 +1258,25 @@ void dispatch_push_ring_ag_gemm(ag_globals g) {
     ag_gemm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
+// Direct push AG (best iris AG) + TK GEMM
+void dispatch_direct_push_ag_gemm(ag_globals g) {
+    // AG phase: direct push from cached shard (work_counter_ptr = cached shard ptr)
+    // For simplicity, just use the iris heap shard here (a_shard)
+    int shard_elements = g.M * g.K_local;
+    int blocks_per_rank = 64;
+    int total_blocks = g.world_size * blocks_per_rank;
+
+    ag_direct_push_kernel<<<total_blocks, DIRECT_AG_THREADS, 0, g.stream>>>(
+        g.a_shard.raw_ptr, g.a_local.raw_ptr,
+        g.iris_ctx, shard_elements, g.world_size, blocks_per_rank);
+
+    // GEMM phase
+    const unsigned long mem_size = g.dynamic_shared_memory();
+    hipFuncSetAttribute((void*)ag_gemm_kernel,
+                        hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    ag_gemm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+}
+
 #define BIND_AG_GLOBALS \
     &ag_globals::a_shard, \
     &ag_globals::a_local, \
@@ -1061,4 +1306,15 @@ PYBIND11_MODULE(tk_kernel, m) {
     // Host-side ring: per-step dispatch with iris.barrier() between steps
     // Python passes 'step' as the num_output_tiles argument (overloaded)
     py::bind_function<dispatch_push_ring_step>(m, "dispatch_push_ring_step", BIND_AG_GLOBALS);
+
+    // Direct parallel AG (fully-connected mesh, all links simultaneously)
+    py::bind_function<dispatch_direct_pull_ag>(m, "dispatch_direct_pull_ag", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag>(m, "dispatch_direct_push_ag", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_cached_ag>(m, "dispatch_direct_push_cached_ag", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag_gemm>(m, "dispatch_direct_push_ag_gemm", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_memcpy_push_ag>(m, "dispatch_memcpy_push_ag", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag_8>(m, "dispatch_direct_push_ag_8", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag_16>(m, "dispatch_direct_push_ag_16", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag_64>(m, "dispatch_direct_push_ag_64", BIND_AG_GLOBALS);
+    py::bind_function<dispatch_direct_push_ag_128>(m, "dispatch_direct_push_ag_128", BIND_AG_GLOBALS);
 }
